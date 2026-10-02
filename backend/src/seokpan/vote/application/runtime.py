@@ -130,6 +130,27 @@ class AcquireRuntimeResolver:
 
 
 @dataclass(frozen=True, slots=True)
+class AcquireRuntimeDeparture(AcquireRuntimeResolver):
+    """Reserve a VOTING Turn for a confirmed departure, using its shared lease.
+
+    The reservation survives logical lease expiry; only another departure
+    owner may take it over. A normal Turn cannot close across this reservation.
+    """
+
+    end_reason: EndReason
+    winner: Stone
+    expected_room_state_version: int
+
+    def __post_init__(self) -> None:
+        AcquireRuntimeResolver.__post_init__(self)
+        _positive(self.expected_room_state_version, code="INVALID_STATE_VERSION")
+        if not (
+            self.end_reason is EndReason.FORFEIT and self.winner in {Stone.BLACK, Stone.WHITE}
+        ) and not (self.end_reason is EndReason.JOINT_LOSS and self.winner is Stone.EMPTY):
+            raise VoteRuleViolation("INVALID_EXTERNAL_GAME_RESULT")
+
+
+@dataclass(frozen=True, slots=True)
 class ApplyRuntimeResolution:
     room_id: str
     request_id: str
@@ -181,11 +202,13 @@ class FinalizeRuntimeGame:
     expected_state_version: int
     end_reason: EndReason
     winner: Stone
+    resolution_id: str
 
     def __post_init__(self) -> None:
         _base(self.room_id, self.request_id, self.game_id)
         _positive(self.turn_no, code="INVALID_TURN_NUMBER")
         _positive(self.expected_state_version, code="INVALID_STATE_VERSION")
+        _identifier(self.resolution_id, code="INVALID_RESOLUTION_ID")
         valid = (
             self.end_reason is EndReason.FORFEIT and self.winner in {Stone.BLACK, Stone.WHITE}
         ) or (
@@ -197,9 +220,18 @@ class FinalizeRuntimeGame:
 
 
 @dataclass(frozen=True, slots=True)
+class DepartureFinalization:
+    end_reason: EndReason
+    winner: Stone
+    expected_move_no: int
+    ended_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class ResolverLease:
     resolution_id: str
     expires_at_ms: int
+    departure: DepartureFinalization | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +279,8 @@ class VoteRuntimePort(Protocol):
     async def close_turn(self, command: CloseRuntimeTurn) -> VoteMutationResult: ...
 
     async def acquire_resolver(self, command: AcquireRuntimeResolver) -> VoteMutationResult: ...
+
+    async def acquire_departure(self, command: AcquireRuntimeDeparture) -> VoteMutationResult: ...
 
     async def apply_resolution(self, command: ApplyRuntimeResolution) -> VoteMutationResult: ...
 

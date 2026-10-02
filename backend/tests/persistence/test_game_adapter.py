@@ -429,7 +429,7 @@ async def test_existing_move_treats_naive_mariadb_datetime_as_utc_for_idempotenc
     existing = MariaDBGamePersistenceAdapter._move_row(command)
     existing.confirmed_at = DB_NOW
     session = FakeSession(
-        rows={(MoveRow, (GAME_ID, 1)): existing},
+        rows={(GameRow, GAME_ID): game_row(), (MoveRow, (GAME_ID, 1)): existing},
         execute_results=[[existing]],
     )
 
@@ -460,7 +460,7 @@ async def test_load_game_restores_mariadb_datetime_as_utc_application_time() -> 
 
 @pytest.mark.asyncio
 async def test_append_move_maps_canonical_coordinate_to_schema_zero_based_axes() -> None:
-    session = FakeSession(execute_results=[[]])
+    session = FakeSession(rows={(GameRow, GAME_ID): game_row()}, execute_results=[[]])
     adapter = MariaDBGamePersistenceAdapter(SessionFactory(session))
 
     outcome = await adapter.append_move(move_command())
@@ -476,7 +476,7 @@ async def test_same_move_is_idempotent_and_conflicting_sequence_is_rejected() ->
     command = move_command()
     existing = MariaDBGamePersistenceAdapter._move_row(command)
     same = FakeSession(
-        rows={(MoveRow, (GAME_ID, 1)): existing},
+        rows={(GameRow, GAME_ID): game_row(), (MoveRow, (GAME_ID, 1)): existing},
         execute_results=[[existing]],
     )
     assert await MariaDBGamePersistenceAdapter(SessionFactory(same)).append_move(command) is (
@@ -484,7 +484,7 @@ async def test_same_move_is_idempotent_and_conflicting_sequence_is_rejected() ->
     )
 
     conflicting = FakeSession(
-        rows={(MoveRow, (GAME_ID, 1)): existing},
+        rows={(GameRow, GAME_ID): game_row(), (MoveRow, (GAME_ID, 1)): existing},
         execute_results=[[existing]],
     )
     changed = OfficialMoveRecord(
@@ -500,6 +500,48 @@ async def test_same_move_is_idempotent_and_conflicting_sequence_is_rejected() ->
     with pytest.raises(PersistenceRuleViolation, match="MOVE_SEQUENCE_CONFLICT"):
         await MariaDBGamePersistenceAdapter(SessionFactory(conflicting)).append_move(changed)
     assert conflicting.rollback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_finished_game_rejects_new_move_but_preserves_exact_commit_retry() -> None:
+    game = game_row()
+    game.status = "COMPLETED"
+    blocked = FakeSession(rows={(GameRow, GAME_ID): game}, execute_results=[[]])
+    with pytest.raises(PersistenceRuleViolation, match="GAME_STATUS_CONFLICT"):
+        await MariaDBGamePersistenceAdapter(SessionFactory(blocked)).append_move(move_command())
+    assert blocked.added == [] and blocked.rollback_count == 1
+    move = MariaDBGamePersistenceAdapter._move_row(move_command())
+    replay = FakeSession(
+        rows={(GameRow, GAME_ID): game, (MoveRow, (GAME_ID, 1)): move},
+        execute_results=[[move]],
+    )
+    assert (
+        await MariaDBGamePersistenceAdapter(SessionFactory(replay)).append_move(move_command())
+        is PersistenceOutcome.UNCHANGED
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_terminal_writer_cannot_finalize_over_new_durable_move() -> None:
+    game = game_row()
+    session = FakeSession(rows={(GameRow, GAME_ID): game}, execute_results=[[9]])
+    command = replace(completed_result(), expected_move_no=8)
+    with pytest.raises(PersistenceRuleViolation, match="GAME_HISTORY_CHANGED"):
+        await MariaDBGamePersistenceAdapter(SessionFactory(session)).finalize_game(command)
+    assert session.added == [] and game.status == "IN_PROGRESS"
+    assert session.rollback_count == 1 and session.commit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_matching_terminal_history_guard_does_not_block_finalization() -> None:
+    game = game_row()
+    session = FakeSession(rows={(GameRow, GAME_ID): game}, execute_results=[[]])
+    command = replace(completed_result(system_invalid=True), expected_move_no=0)
+    assert (
+        await MariaDBGamePersistenceAdapter(SessionFactory(session)).finalize_game(command)
+        is PersistenceOutcome.CREATED
+    )
+    assert game.status == "SYSTEM_INVALID" and session.commit_count == 1
 
 
 @pytest.mark.asyncio
@@ -707,7 +749,9 @@ async def test_uncertain_commit_converges_only_when_result_is_visible_as_complet
 
 @pytest.mark.asyncio
 async def test_uncertain_commit_without_matching_row_returns_stable_error() -> None:
-    writing = FakeSession(execute_results=[[]], fail_commit=True)
+    writing = FakeSession(
+        rows={(GameRow, GAME_ID): game_row()}, execute_results=[[]], fail_commit=True
+    )
     verifying = FakeSession(execute_results=[[]])
     adapter = MariaDBGamePersistenceAdapter(SessionFactory(writing, verifying))
 

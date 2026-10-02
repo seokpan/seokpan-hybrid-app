@@ -146,7 +146,11 @@ async def setup_runner(
 ]:
     clock = ManualClock()
     room_store = rooms if rooms is not None else InMemoryRoomRuntimeAdapter(clock)
-    vote_store = votes if votes is not None else InMemoryVoteRuntimeAdapter(clock)
+    vote_store = (
+        votes
+        if votes is not None
+        else InMemoryVoteRuntimeAdapter(clock, room_lookup=room_store.get)
+    )
     member_ratings = {1: 1000, 2: 1000, 3: 1000}
     game_store = games if games is not None else InMemoryGamePersistenceAdapter(member_ratings)
     await room_store.create(
@@ -429,7 +433,7 @@ async def test_departure_retry_recovers_after_runtime_lookup_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     games = CountingGamePersistenceAdapter()
-    runner, _clock, rooms, votes, _, _ = await setup_runner(games=games)
+    runner, clock, rooms, votes, _, _ = await setup_runner(games=games)
 
     room = await rooms.get(ROOM_ID)
     assert room is not None
@@ -486,6 +490,7 @@ async def test_departure_retry_recovers_after_runtime_lookup_loss(
 
     monkeypatch.setattr(votes, "get", original_get)
 
+    clock.advance(5_001)
     assert await runner.finalize_departures(
         room_id=ROOM_ID,
         game_id=GAME_ID,
@@ -1229,6 +1234,8 @@ async def test_uncertain_result_commit_is_confirmed_before_runtime_and_room_adva
     resolving = await votes.get(ROOM_ID)
     assert resolving is not None
     assert resolving.game_status is GameStatus.ACTIVE
+    assert (await runner.process(due)).status is TurnProcessingStatus.RESOLVER_BUSY
+    clock.advance(5_001)
     assert (await runner.process(due)).status is TurnProcessingStatus.GAME_ENDED
     assert games.finalize_calls == 1
     room = await rooms.get(ROOM_ID)
@@ -1254,6 +1261,8 @@ async def test_result_write_failure_retries_before_runtime_and_room_advance() ->
     resolving = await votes.get(ROOM_ID)
     assert resolving is not None
     assert resolving.game_status is GameStatus.ACTIVE
+    assert (await runner.process(due)).status is TurnProcessingStatus.RESOLVER_BUSY
+    clock.advance(5_001)
     assert (await runner.process(due)).status is TurnProcessingStatus.GAME_ENDED
     assert games.finalize_calls == 2
     room = await rooms.get(ROOM_ID)

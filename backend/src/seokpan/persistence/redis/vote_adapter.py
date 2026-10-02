@@ -22,10 +22,12 @@ from seokpan.room.application import ROOM_REQUEST_DEDUPE_TTL_MS
 from seokpan.vote.application import (
     RESOLVER_LEASE_MS,
     VOTE_RUNTIME_SCHEMA_VERSION,
+    AcquireRuntimeDeparture,
     AcquireRuntimeResolver,
     ApplyRuntimeResolution,
     CastRuntimeVote,
     CloseRuntimeTurn,
+    DepartureFinalization,
     FinalizeRuntimeGame,
     InitializeVoteRuntime,
     RemoveRuntimeVote,
@@ -194,6 +196,23 @@ class RedisVoteRuntimeAdapter:
             },
         )
 
+    async def acquire_departure(self, command: AcquireRuntimeDeparture) -> VoteMutationResult:
+        return await self._mutate(
+            command.room_id,
+            command.request_id,
+            "acquire_departure",
+            command.turn_no,
+            {
+                "game_id": command.game_id,
+                "turn_no": command.turn_no,
+                "resolution_id": command.resolution_id,
+                "expected_state_version": command.expected_state_version,
+                "expected_room_state_version": command.expected_room_state_version,
+                "end_reason": command.end_reason.value,
+                "winner": command.winner.value,
+            },
+        )
+
     async def apply_resolution(self, command: ApplyRuntimeResolution) -> VoteMutationResult:
         resolution = command.resolution
         return await self._mutate(
@@ -232,6 +251,7 @@ class RedisVoteRuntimeAdapter:
                 "expected_state_version": command.expected_state_version,
                 "end_reason": command.end_reason.value,
                 "winner": command.winner.value,
+                "resolution_id": command.resolution_id,
             },
         )
 
@@ -498,7 +518,27 @@ class RedisVoteRuntimeAdapter:
         if value is None:
             return None
         item = _mapping(value)
-        return ResolverLease(_string(item, "resolution_id"), _integer(item, "expires_at_ms"))
+        raw = item.get("departure")
+        departure = None
+        if raw is not None:
+            decision = _mapping(raw)
+            reason = EndReason(_string(decision, "end_reason"))
+            winner = Stone(_string(decision, "winner"))
+            move_no = _integer(decision, "expected_move_no")
+            ended_at_ms = _integer(decision, "ended_at_ms")
+            if (
+                not (
+                    (reason is EndReason.FORFEIT and winner in {Stone.BLACK, Stone.WHITE})
+                    or (reason is EndReason.JOINT_LOSS and winner is Stone.EMPTY)
+                )
+                or not 0 <= move_no <= 225
+                or ended_at_ms < 0
+            ):
+                raise RedisProviderError("REDIS_RESPONSE_INVALID")
+            departure = DepartureFinalization(reason, winner, move_no, ended_at_ms)
+        return ResolverLease(
+            _string(item, "resolution_id"), _integer(item, "expires_at_ms"), departure
+        )
 
     @classmethod
     def _optional_closure(cls, value: object) -> TurnClosure | None:

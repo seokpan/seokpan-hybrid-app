@@ -11,6 +11,7 @@ from seokpan.persistence.redis.common import VersionedJsonCodec
 from seokpan.persistence.redis.vote_adapter import RedisVoteRuntimeAdapter
 from seokpan.persistence.redis.vote_scripts import VOTE_DISCARD, VOTE_MUTATION, VOTE_READ
 from seokpan.vote.application import (
+    AcquireRuntimeDeparture,
     AcquireRuntimeResolver,
     ApplyRuntimeResolution,
     CastRuntimeVote,
@@ -186,6 +187,20 @@ class EmulatedVoteRedisClient:
                     expected,
                 )
             )
+        if operation == "acquire_departure":
+            return await self.store.acquire_departure(
+                AcquireRuntimeDeparture(
+                    room_id,
+                    request_id,
+                    game_id,
+                    turn_no,
+                    str(payload["resolution_id"]),
+                    expected,
+                    EndReason(str(payload["end_reason"])),
+                    Stone(str(payload["winner"])),
+                    int(str(payload["expected_room_state_version"])),
+                )
+            )
         if operation == "apply_resolution":
             deadline = payload.get("next_deadline_ms")
             return await self.store.apply_resolution(
@@ -211,6 +226,7 @@ class EmulatedVoteRedisClient:
                     expected_state_version=expected,
                     end_reason=EndReason(str(payload["end_reason"])),
                     winner=Stone(str(payload["winner"])),
+                    resolution_id=str(payload["resolution_id"]),
                 )
             )
         raise AssertionError(f"unexpected operation: {operation}")
@@ -294,6 +310,14 @@ def _snapshot(value: VoteRuntimeSnapshot | None) -> dict[str, object] | None:
             else {
                 "resolution_id": value.resolver.resolution_id,
                 "expires_at_ms": value.resolver.expires_at_ms,
+                "departure": None
+                if value.resolver.departure is None
+                else {
+                    "end_reason": value.resolver.departure.end_reason.value,
+                    "winner": value.resolver.departure.winner.value,
+                    "expected_move_no": value.resolver.departure.expected_move_no,
+                    "ended_at_ms": value.resolver.departure.ended_at_ms,
+                },
             }
         ),
     }

@@ -95,6 +95,9 @@ class MariaDBGamePersistenceAdapter:
 
     async def append_move(self, command: OfficialMoveRecord) -> PersistenceOutcome:
         async def write(session: AsyncSession) -> PersistenceOutcome:
+            game = await session.get(GameRow, command.game_id, with_for_update=True)
+            if game is None:
+                raise PersistenceRuleViolation("GAME_NOT_FOUND")
             by_turn = await session.get(MoveRow, (command.game_id, command.turn_no))
             by_move = (
                 await session.execute(
@@ -109,6 +112,8 @@ class MariaDBGamePersistenceAdapter:
                 if self._move_matches(existing, command):
                     return PersistenceOutcome.UNCHANGED
                 raise PersistenceRuleViolation("MOVE_SEQUENCE_CONFLICT")
+            if game.status != "IN_PROGRESS":
+                raise PersistenceRuleViolation("GAME_STATUS_CONFLICT")
             session.add(self._move_row(command))
             return PersistenceOutcome.CREATED
 
@@ -134,6 +139,20 @@ class MariaDBGamePersistenceAdapter:
                 raise PersistenceRuleViolation("GAME_RESULT_CONFLICT")
             if game.status != "IN_PROGRESS":
                 raise PersistenceRuleViolation("GAME_STATUS_CONFLICT")
+            if command.expected_move_no is not None:
+                # append_move takes the same Game lock. A paused/expired owner
+                # cannot finalize over a Move committed after its history read.
+                latest = (
+                    await session.execute(
+                        select(MoveRow.move_no)
+                        .where(MoveRow.game_id == command.result.game_id)
+                        .order_by(MoveRow.move_no.desc())
+                        .limit(1)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (latest or 0) != command.expected_move_no:
+                    raise PersistenceRuleViolation("GAME_HISTORY_CHANGED")
 
             members = await self._lock_members(session, command.result)
             result_row = self._result_row(command)

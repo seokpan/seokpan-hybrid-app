@@ -7,6 +7,7 @@ from seokpan.game.application import (
     TieSelectionRecord,
     TurnFinalizationApproval,
 )
+from seokpan.game.application.resolution import requires_departure_finalization
 from seokpan.room.application.lobby import LobbyRoomRuntimePort
 from seokpan.room.domain import RoomStatus
 from seokpan.vote.application import VoteRuntimePort, VoteRuntimeSnapshot
@@ -38,7 +39,11 @@ class MemoryRoomTurnSource:
             vote = await self._votes.get(room.room_id)
             if vote is None or vote.game_id != room.game_id:
                 continue
-            if vote.deadline_ms is None or vote.deadline_ms <= now_ms:
+            if (
+                vote.deadline_ms is None
+                or vote.deadline_ms <= now_ms
+                or requires_departure_finalization(room, vote)
+            ):
                 result.append(DueTurn(room.room_id, vote.game_id, vote.turn_no))
             if len(result) == limit:
                 break

@@ -18,4 +18,4 @@
 
 1차 Image Pipeline은 기존 Harbor 프로젝트와 `seokpan-gitops`를 대상으로 한다. 이관본의 루트 Image Pipeline 진입점은 CI #2 전환이 완료될 때까지 즉시 중단한다. 원본은 `reference/phase1-ci/Jenkinsfile.image-pipeline`에 그대로 보존하며 실행 Job으로 등록하지 않는다. 1차 Pipeline·Job·공유 Template은 변경하지 않았다.
 
-이번 Source 수정은 App #1의 환경별 대상 검사와 Redis TLS·별도 AUTH 계약이다. Dependency/Lock·게임 Lifecycle 모드·DB Schema·실제 Redis Runtime 배치·Cloud 생성/삭제·목표 RTO/RPO를 변경하지 않는다. 구체적인 검사와 미실행 범위는 `backend/docs/hybrid-connections.md` 및 작업 Issue 인계를 따른다.
+이관 이후 Source 수정은 App #1의 환경별 대상 검사와 Redis TLS·별도 AUTH 계약, 별도 App #4 TH-14 검토로 재현한 Turn/Departure 종료 경쟁 보완이다. 연결 구현 당시 검사는 [연결 계약](backend/docs/hybrid-connections.md), 뒤의 공유 최종화 예약·DB 보호·재시도와 제한된 회귀는 [Turn/Departure 최종화](backend/docs/turn-departure-finalization.md)에서 구분한다. Dependency/Lock·게임 Lifecycle 모드 선택·DB Schema·실제 Redis Runtime 배치·Cloud 생성/삭제·목표 RTO/RPO를 변경하지 않는다. Source 검사는 실제 다중 Pod 업무 시험과 Image·배포·복구 수락을 대신하지 않는다.

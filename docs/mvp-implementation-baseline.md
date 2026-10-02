@@ -222,6 +222,7 @@ Envelope의 `state_version`은 Lobby 또는 Room별 WebSocket Stream 순서다. 
 - 유예 만료 뒤 이미 승계가 끝난 이전 방장이 재접속해도 방장 권한은 자동 복귀하지 않는다.
 - `WAITING` Room 종료에는 Game·Result·Rating을 만들지 않는다.
 - `PLAYING`에서 Room이 유지되면 단절 참가자의 Vote만 제거한다. Room 종료로 Game을 계속할 수 없을 때만 `SYSTEM_INVALID`로 종결하고 개인 전적·Rating을 반영하지 않는다.
+- Turn/퇴장/Room 폐쇄가 경쟁할 때는 [공유 최종화 순서](../backend/docs/turn-departure-finalization.md)를 따른다. 이미 `RESOLVING`인 Turn의 착수를 먼저 수렴하며, `VOTING`에서 live Room·로스터로 검증해 선택한 최초 terminal intent는 뒤의 폐쇄도 같은 결정으로 저장한다. 폐쇄가 그 선택보다 먼저면 새 퇴장 intent를 만들지 않고 기존 `SYSTEM_INVALID` 경로를 따른다. 선택된 intent는 DB Result·전적·Rating 반영 전까지 종료 완료가 아니다.
 - Backend, Redis 또는 플랫폼 장애를 개인 이탈로 오판해 승계·몰수패·공동 패배를 확정하지 않는다.
 
 ## 8. Redis Runtime State

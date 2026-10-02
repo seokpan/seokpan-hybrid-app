@@ -11,6 +11,7 @@ from seokpan.game.application import (
     TieSelectionRecord,
     TurnFinalizationApproval,
 )
+from seokpan.game.application.resolution import requires_departure_finalization
 from seokpan.persistence.redis.common import (
     LuaScriptRunner,
     RedisClient,
@@ -67,7 +68,11 @@ class RedisTurnCoordinator:
             if (
                 vote is not None
                 and vote.game_id == room.game_id
-                and (vote.deadline_ms is None or vote.deadline_ms <= now_ms)
+                and (
+                    vote.deadline_ms is None
+                    or vote.deadline_ms <= now_ms
+                    or requires_departure_finalization(room, vote)
+                )
             ):
                 result.append(DueTurn(room.room_id, vote.game_id, vote.turn_no))
             if len(result) == limit:

@@ -39,7 +39,7 @@ Migration CLI의 `--expect-host`, `--expect-port`, `--expect-database`는 환경
 
 검증 Runtime은 저장소의 `uv==0.12.5`, Python `3.13.15`, frozen `uv.lock` 전체다. `redis==8.1.0`, `asyncmy==0.2.14`를 포함한 의존 버전을 바꾸지 않았다.
 
-2026-10-02 최종 로컬 검사 결과: 전체 pytest **1,728 통과**, 신규 hybrid 검사 **58 통과**, 전체 ruff 검사/format 검사 통과, mypy **119 Source 파일 통과**. 최초 검사 1,724/54 이후 CA 경로 repr를 보완했고, 이번 재귀 검토에서 빈 Fragment로 URL 검사와 Driver의 charset 해석이 달라지는 경우를 거부하도록 보완했다. 정상 URL 인코딩 비밀번호는 유지하며 관련 155개와 최종 전체 회귀를 통과했다. 이 숫자는 App 로컬 코드 검사 결과이며 Cloud/lab/Recovery의 Acceptance 결과가 아니다.
+2026-10-02 **연결 계약 구현 완료 시점**의 로컬 검사 결과: 전체 pytest **1,728 통과**, 신규 hybrid 검사 **58 통과**, 전체 ruff 검사/format 검사 통과, mypy **119 Source 파일 통과**. 최초 검사 1,724/54 이후 CA 경로 repr를 보완했고, 당시 재귀 검토에서 빈 Fragment로 URL 검사와 Driver의 charset 해석이 달라지는 경우를 거부하도록 보완했다. 정상 URL 인코딩 비밀번호는 유지하며 관련 155개와 당시 전체 회귀를 통과했다. 이 숫자는 연결 구현 당시 App 로컬 코드 검사 결과이며 Cloud/lab/Recovery의 Acceptance 결과가 아니다. 이후 별도 TH-14 경쟁 보완과 그 검사 범위는 [Turn/Departure 최종화](turn-departure-finalization.md)로 연결한다.
 
 ```sh
 uv sync --frozen --all-groups

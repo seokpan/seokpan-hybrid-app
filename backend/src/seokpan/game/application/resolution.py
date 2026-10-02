@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
+from uuid import uuid4
 
 from seokpan.game.application.history import replay_game_history
 from seokpan.game.application.persistence import (
@@ -24,6 +25,7 @@ from seokpan.game.domain import (
     GameResultService,
     GameRuleViolation,
     GameStatus,
+    Stone,
 )
 from seokpan.room.application import (
     CompleteRoomGame,
@@ -34,14 +36,17 @@ from seokpan.room.application import (
 )
 from seokpan.room.domain import RoomRuleViolation, RoomStatus
 from seokpan.vote.application import (
+    AcquireRuntimeDeparture,
     AcquireRuntimeResolver,
     ApplyRuntimeResolution,
     CloseRuntimeTurn,
+    DepartureFinalization,
     FinalizeRuntimeGame,
     VoteRuntimePort,
     VoteRuntimeSnapshot,
 )
 from seokpan.vote.domain import (
+    ParticipantRole,
     TurnResolution,
     TurnResultKind,
     TurnStatus,
@@ -162,72 +167,190 @@ class TurnResolutionRunner:
         self._captured_completion = captured_completion
 
     async def finalize_departures(self, *, room_id: str, game_id: str) -> bool:
-        """Finalize an active Game after Room state confirms player departures."""
+        """Select a shared terminal intent, then persist and converge its result.
+
+        A closed Turn owns adjudication first. Its durable Move must reach Redis
+        before a departure can reserve the next VOTING Turn. Reservation expiry
+        permits takeover, never a competing normal close or a different result.
+        """
         room = await self._rooms.get(room_id)
         runtime = await self._votes.get(room_id)
         if room is None or runtime is None or room.game_id != game_id or runtime.game_id != game_id:
             return False
-
+        if room.status is not RoomStatus.PLAYING:
+            return False
+        if runtime.turn_status is TurnStatus.RESOLVING:
+            # The existing due-turn discovery retries this closed Turn. After
+            # apply_resolution (including response loss) shared Room departures
+            # also make its successor discoverable before the next deadline.
+            return False
         history = await self._games.load_game(game_id)
         if history is None:
             raise PersistenceRuleViolation("GAME_NOT_FOUND")
+        if not requires_departure_finalization(room, runtime):
+            return False
         roster_ids = {item.participant_id for item in history.participants}
         present_ids = {item.participant_id for item in room.participants}
         departed = frozenset(roster_ids - present_ids)
-        if not departed:
-            return False
-
         stored = await self._games.load_result(game_id)
-        if stored is None:
-            game = self._rebuild_before_turn(runtime, history)
-            try:
-                result = GameResultService(
-                    game_id=game_id,
-                    game=game,
-                    participants=history.participants,
-                ).finalize_confirmed_departures(departed_participant_ids=departed)
-            except GameResultRuleViolation as error:
-                if error.code == "FORFEIT_NOT_CONFIRMED":
-                    return False
-                raise
-            command = FinalizeGameCommand(
-                result=result,
-                ended_at=datetime.fromtimestamp(self._clock.now_ms / 1000, UTC),
-            )
-            if not await self._games.result_matches(command):
-                await self._games.finalize_game(command)
-            end_reason = result.end_reason
-            winner = result.winner
-        else:
-            if stored.end_reason not in {EndReason.FORFEIT, EndReason.JOINT_LOSS}:
-                return False
-            end_reason = stored.end_reason
-            winner = stored.winner
-
-        runtime = await self._votes.get(room_id)
-        if runtime is None or runtime.game_id != game_id:
+        if stored is not None and stored.end_reason not in {
+            EndReason.FORFEIT,
+            EndReason.JOINT_LOSS,
+        }:
             return False
         if runtime.game_status is GameStatus.ACTIVE:
-            finalized = await self._votes.finalize_game(
-                FinalizeRuntimeGame(
-                    room_id=room_id,
-                    request_id=_stable_id(
-                        "departure-finalize",
-                        DueTurn(room_id, game_id, runtime.turn_no),
-                    ),
-                    game_id=game_id,
-                    turn_no=runtime.turn_no,
-                    expected_state_version=runtime.state_version,
-                    end_reason=end_reason,
-                    winner=winner,
+            existing = None if runtime.resolver is None else runtime.resolver.departure
+            if existing is not None:
+                end_reason, winner = existing.end_reason, existing.winner
+            elif stored is not None:
+                end_reason, winner = stored.end_reason, stored.winner
+            else:
+                game = self._rebuild_before_turn(runtime, history)
+                try:
+                    result = GameResultService(
+                        game_id=game_id,
+                        game=game,
+                        participants=history.participants,
+                    ).finalize_confirmed_departures(departed_participant_ids=departed)
+                except GameResultRuleViolation as error:
+                    if error.code == "FORFEIT_NOT_CONFIRMED":
+                        return False
+                    raise
+                end_reason, winner = result.end_reason, result.winner
+            token = f"departure-{uuid4().hex}"
+            try:
+                leased = await self._votes.acquire_departure(
+                    AcquireRuntimeDeparture(
+                        room_id=room_id,
+                        request_id=f"lease-{uuid4().hex}",
+                        game_id=game_id,
+                        turn_no=runtime.turn_no,
+                        resolution_id=token,
+                        expected_state_version=runtime.state_version,
+                        end_reason=end_reason,
+                        winner=winner,
+                        expected_room_state_version=room.state_version,
+                    )
                 )
+            except VoteRuleViolation as error:
+                if error.code in {
+                    "RESOLVER_LEASE_HELD",
+                    "STATE_VERSION_CONFLICT",
+                    "TURN_NOT_VOTING",
+                    "GAME_NOT_ACTIVE",
+                    "STALE_GAME",
+                    "STALE_TURN",
+                    "ROOM_NOT_FOUND",
+                    "GAME_NOT_IN_CURRENT_ROOM",
+                    "GAME_RUNTIME_NOT_FOUND",
+                    "DEPARTURE_RESULT_CHANGED",
+                    "FORFEIT_NOT_CONFIRMED",
+                }:
+                    return False
+                raise
+            decision = (
+                None if leased.snapshot.resolver is None else leased.snapshot.resolver.departure
             )
-            runtime = finalized.snapshot
+            if decision is None:
+                raise VoteRuleViolation("DEPARTURE_FINALIZATION_MISSING")
+            await self._persist_departure(leased.snapshot, decision)
+            runtime = await self._votes.get(room_id)
+            if runtime is None or runtime.game_id != game_id:
+                return False
+            if runtime.game_status is GameStatus.ACTIVE:
+                try:
+                    finalized = await self._votes.finalize_game(
+                        FinalizeRuntimeGame(
+                            room_id=room_id,
+                            request_id=_stable_id(
+                                "departure-finalize", DueTurn(room_id, game_id, runtime.turn_no)
+                            ),
+                            game_id=game_id,
+                            turn_no=runtime.turn_no,
+                            expected_state_version=runtime.state_version,
+                            end_reason=decision.end_reason,
+                            winner=decision.winner,
+                            resolution_id=token,
+                        )
+                    )
+                except VoteRuleViolation as error:
+                    if error.code in {
+                        "RESOLVER_NOT_OWNER",
+                        "RESOLVER_LEASE_EXPIRED",
+                        "STATE_VERSION_CONFLICT",
+                        "STALE_GAME",
+                        "STALE_TURN",
+                        "GAME_RUNTIME_NOT_FOUND",
+                    } and (
+                        error.code == "RESOLVER_LEASE_EXPIRED"
+                        or await self._runtime_changed(runtime, token)
+                    ):
+                        return False
+                    raise
+                runtime = finalized.snapshot
+        elif stored is None:
+            raise PersistenceRuleViolation("GAME_RESULT_INCOMPLETE")
 
         due = DueTurn(room_id, game_id, runtime.turn_no)
         await self._game_finished(due, runtime)
         await self._complete_room(due)
         return True
+
+    async def _persist_departure(
+        self, runtime: VoteRuntimeSnapshot, decision: DepartureFinalization
+    ) -> None:
+        stored = await self._games.load_result(runtime.game_id)
+        if stored is not None:
+            if (stored.end_reason, stored.winner) != (decision.end_reason, decision.winner):
+                raise PersistenceRuleViolation("GAME_RESULT_CONFLICT")
+            return
+        history = await self._games.load_game(runtime.game_id)
+        if history is None:
+            raise PersistenceRuleViolation("GAME_NOT_FOUND")
+        game = self._rebuild_before_turn(runtime, history)
+        if game.move_no != decision.expected_move_no:
+            raise PersistenceRuleViolation("GAME_RUNTIME_HISTORY_MISMATCH")
+        if decision.end_reason is EndReason.FORFEIT:
+            game.finish_forfeit(
+                losing_team=Stone.WHITE if decision.winner is Stone.BLACK else Stone.BLACK
+            )
+        else:
+            game.finish_joint_loss()
+        result = GameResultService(
+            game_id=runtime.game_id, game=game, participants=history.participants
+        ).finalize_completed_game()
+        command = FinalizeGameCommand(
+            result=result,
+            ended_at=datetime.fromtimestamp(decision.ended_at_ms / 1000, UTC),
+            expected_move_no=decision.expected_move_no,
+        )
+        if not await self._games.result_matches(command):
+            await self._games.finalize_game(command)
+
+    async def _runtime_changed(self, reference: VoteRuntimeSnapshot, owner: str) -> bool:
+        """Require a fresh shared fact before classifying an unexpected stale rejection."""
+        current = await self._votes.get(reference.room_id)
+        return (
+            current is None
+            or current.game_id != reference.game_id
+            or current.turn_no != reference.turn_no
+            or current.state_version != reference.state_version
+            or current.turn_status is not reference.turn_status
+            or current.game_status is not reference.game_status
+            or current.resolver is None
+            or current.resolver.resolution_id != owner
+        )
+
+    async def _departure_pending(self, snapshot: VoteRuntimeSnapshot) -> bool:
+        if snapshot.resolver is not None and snapshot.resolver.departure is not None:
+            return True
+        room = await self._rooms.get(snapshot.room_id)
+        return (
+            room is not None
+            and room.status is RoomStatus.PLAYING
+            and room.game_id == snapshot.game_id
+            and requires_departure_finalization(room, snapshot)
+        )
 
     async def finalize_system_invalid(
         self,
@@ -265,6 +388,19 @@ class TurnResolutionRunner:
             runtime_to_discard = runtime.game_id
             runtime = None
 
+        if (
+            runtime is not None
+            and runtime.resolver is not None
+            and runtime.resolver.departure is not None
+        ):
+            # The first valid terminal intent is selected atomically while Room
+            # is PLAYING. A later closure consumes that same intent; it cannot
+            # cancel an owner that may already be committing its SQL result.
+            await self._persist_departure(runtime, runtime.resolver.departure)
+            await self._votes.discard_game(room_id, runtime_to_discard)
+            await self._acknowledge_invalidation(room_id, game_id, closed_at_ms)
+            return False
+
         if stored is not None and stored.end_reason is not EndReason.SYSTEM_INVALID:
             await self._votes.discard_game(room_id, runtime_to_discard)
             await self._acknowledge_invalidation(room_id, game_id, closed_at_ms)
@@ -299,6 +435,7 @@ class TurnResolutionRunner:
             command = FinalizeGameCommand(
                 result=result,
                 ended_at=datetime.fromtimestamp(closed_at_ms / 1000, UTC),
+                expected_move_no=len(history.moves),
             )
             if not await self._games.result_matches(command):
                 await self._games.finalize_game(command)
@@ -404,6 +541,18 @@ class TurnResolutionRunner:
             await self._game_finished(due_turn, snapshot)
             await self._complete_room(due_turn)
             return TurnProcessingResult(due_turn, TurnProcessingStatus.GAME_ENDED)
+        if snapshot.turn_status is TurnStatus.VOTING:
+            if await self.finalize_departures(room_id=due_turn.room_id, game_id=due_turn.game_id):
+                return TurnProcessingResult(due_turn, TurnProcessingStatus.GAME_ENDED)
+            snapshot = await self._votes.get(due_turn.room_id)
+            if (
+                snapshot is None
+                or snapshot.game_id != due_turn.game_id
+                or snapshot.turn_no != due_turn.turn_no
+            ):
+                return TurnProcessingResult(due_turn, TurnProcessingStatus.STALE)
+            if await self._departure_pending(snapshot):
+                return TurnProcessingResult(due_turn, TurnProcessingStatus.RETRY_REQUIRED)
         if snapshot.deadline_ms is not None and self._clock.now_ms < snapshot.deadline_ms:
             return TurnProcessingResult(due_turn, TurnProcessingStatus.NOT_DUE)
         if snapshot.turn_status is TurnStatus.VOTING:
@@ -415,20 +564,34 @@ class TurnResolutionRunner:
                 return TurnProcessingResult(due_turn, TurnProcessingStatus.RECOVERY_REQUIRED)
             room = await self._require_playing_room(due_turn)
             assert snapshot.deadline_ms is not None
-            closed = await self._votes.close_turn(
-                CloseRuntimeTurn(
-                    room_id=due_turn.room_id,
-                    request_id=_stable_id("close", due_turn),
-                    game_id=due_turn.game_id,
-                    turn_no=due_turn.turn_no,
-                    expected_state_version=snapshot.state_version,
-                    next_deadline_ms=snapshot.deadline_ms + room.config.vote_seconds * 1000,
+            try:
+                closed = await self._votes.close_turn(
+                    CloseRuntimeTurn(
+                        room_id=due_turn.room_id,
+                        request_id=_stable_id("close", due_turn),
+                        game_id=due_turn.game_id,
+                        turn_no=due_turn.turn_no,
+                        expected_state_version=snapshot.state_version,
+                        next_deadline_ms=snapshot.deadline_ms + room.config.vote_seconds * 1000,
+                    )
                 )
-            )
+            except VoteRuleViolation as error:
+                if error.code == "DEPARTURE_FINALIZATION_PENDING":
+                    current = await self._votes.get(due_turn.room_id)
+                    if current is not None and await self._departure_pending(current):
+                        return TurnProcessingResult(due_turn, TurnProcessingStatus.RETRY_REQUIRED)
+                raise
             if closed.closure is None:
                 raise VoteRuleViolation("TURN_CLOSURE_MISSING")
             if closed.closure.result is TurnResultKind.PASSED:
                 await self._turn_passed(due_turn, closed.snapshot)
+                if await self.finalize_departures(
+                    room_id=due_turn.room_id, game_id=due_turn.game_id
+                ):
+                    return TurnProcessingResult(due_turn, TurnProcessingStatus.GAME_ENDED)
+                current = await self._votes.get(due_turn.room_id)
+                if current is not None and await self._departure_pending(current):
+                    return TurnProcessingResult(due_turn, TurnProcessingStatus.RETRY_REQUIRED)
                 return TurnProcessingResult(due_turn, TurnProcessingStatus.PASS)
             snapshot = closed.snapshot
         elif snapshot.turn_status is not TurnStatus.RESOLVING:
@@ -436,16 +599,15 @@ class TurnResolutionRunner:
 
         await self._turn_resolving(due_turn, snapshot)
 
+        resolution_id = f"resolution-{self._runner_id}-{uuid4().hex[:24]}"
         try:
             leased = await self._votes.acquire_resolver(
                 AcquireRuntimeResolver(
                     room_id=due_turn.room_id,
-                    request_id=_stable_id(
-                        f"lease-{self._runner_id}-{self._clock.now_ms}", due_turn
-                    ),
+                    request_id=f"lease-{uuid4().hex}",
                     game_id=due_turn.game_id,
                     turn_no=due_turn.turn_no,
-                    resolution_id=self._resolution_id(due_turn),
+                    resolution_id=resolution_id,
                     expected_state_version=snapshot.state_version,
                 )
             )
@@ -485,10 +647,10 @@ class TurnResolutionRunner:
             applied = await self._votes.apply_resolution(
                 ApplyRuntimeResolution(
                     room_id=due_turn.room_id,
-                    request_id=_stable_id("apply", due_turn),
+                    request_id=f"apply-{uuid4().hex}",
                     game_id=due_turn.game_id,
                     turn_no=due_turn.turn_no,
-                    resolution_id=self._resolution_id(due_turn),
+                    resolution_id=resolution_id,
                     resolution=resolution,
                     expected_state_version=leased.snapshot.state_version,
                     persistence_confirmed=True,
@@ -500,7 +662,11 @@ class TurnResolutionRunner:
                 )
             )
         except VoteRuleViolation as error:
-            if error.code in {"RESOLVER_LEASE_EXPIRED", "RESOLVER_NOT_OWNER"}:
+            if error.code in {"RESOLVER_LEASE_EXPIRED", "RESOLVER_NOT_OWNER"} or (
+                error.code
+                in {"STATE_VERSION_CONFLICT", "TURN_NOT_RESOLVING", "STALE_GAME", "STALE_TURN"}
+                and await self._runtime_changed(leased.snapshot, resolution_id)
+            ):
                 return TurnProcessingResult(
                     due_turn,
                     TurnProcessingStatus.RETRY_REQUIRED,
@@ -514,6 +680,15 @@ class TurnResolutionRunner:
             await self._move_applied(due_turn, leased.snapshot, applied.snapshot)
 
         if resolution.end_reason is None:
+            if await self.finalize_departures(room_id=due_turn.room_id, game_id=due_turn.game_id):
+                return TurnProcessingResult(
+                    due_turn, TurnProcessingStatus.GAME_ENDED, applied.resolution
+                )
+            current = await self._votes.get(due_turn.room_id)
+            if current is not None and await self._departure_pending(current):
+                return TurnProcessingResult(
+                    due_turn, TurnProcessingStatus.RETRY_REQUIRED, applied.resolution
+                )
             return TurnProcessingResult(due_turn, TurnProcessingStatus.MOVE, applied.resolution)
         await self._game_finished(due_turn, applied.snapshot)
         await self._complete_room(due_turn)
@@ -851,8 +1026,23 @@ class TurnResolutionRunner:
             timestamp_ms = self._clock.now_ms
         return datetime.fromtimestamp(timestamp_ms / 1000, UTC)
 
-    def _resolution_id(self, due_turn: DueTurn) -> str:
-        return _stable_id(f"resolution-{self._runner_id}", due_turn)
+
+def requires_departure_finalization(
+    room: RoomRuntimeSnapshot, snapshot: VoteRuntimeSnapshot
+) -> bool:
+    """Shared discovery fact; no local request/cache is required for retries."""
+    if snapshot.resolver is not None and snapshot.resolver.departure is not None:
+        return True
+    present = {item.participant_id for item in room.participants}
+    for team in (Stone.BLACK, Stone.WHITE):
+        roster = {
+            item.participant_id
+            for item in snapshot.participants
+            if item.role is ParticipantRole.PLAYER and item.team is team
+        }
+        if roster and roster.isdisjoint(present):
+            return True
+    return False
 
 
 def _stable_id(prefix: str, due_turn: DueTurn) -> str:

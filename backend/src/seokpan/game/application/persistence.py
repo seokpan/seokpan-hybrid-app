@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
@@ -122,9 +122,12 @@ class OfficialMoveRecord:
 class FinalizeGameCommand:
     result: GameResult
     ended_at: datetime
+    expected_move_no: int | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         require_uuid4(self.result.game_id, code="INVALID_GAME_ID")
+        if self.expected_move_no is not None and not 0 <= self.expected_move_no <= 225:
+            raise PersistenceRuleViolation("INVALID_MOVE_SEQUENCE")
         if self.result.status is GameStatus.ACTIVE:
             raise PersistenceRuleViolation("GAME_NOT_FINISHED")
         if not self.result.stats_eligible and self.result.rating_adjustments:

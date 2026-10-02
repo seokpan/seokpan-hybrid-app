@@ -9,15 +9,17 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from seokpan.clock import MillisecondClock
-from seokpan.game.domain import Game, GameStatus
+from seokpan.game.domain import EndReason, Game, GameStatus, Stone
 from seokpan.room.application import ROOM_REQUEST_DEDUPE_TTL_MS, RoomRuntimeSnapshot
 from seokpan.room.domain import RoomStatus
 from seokpan.vote.application import (
     RESOLVER_LEASE_MS,
+    AcquireRuntimeDeparture,
     AcquireRuntimeResolver,
     ApplyRuntimeResolution,
     CastRuntimeVote,
     CloseRuntimeTurn,
+    DepartureFinalization,
     FinalizeRuntimeGame,
     InitializeVoteRuntime,
     RemoveRuntimeVote,
@@ -171,6 +173,8 @@ class InMemoryVoteRuntimeAdapter:
         if replay is not None:
             return replay
         state = self._require(command)
+        if state.resolver is not None and state.resolver.departure is not None:
+            raise VoteRuleViolation("DEPARTURE_FINALIZATION_PENDING")
         before = state.game.votes
         state.game.cast_vote(
             game_id=command.game_id,
@@ -188,6 +192,8 @@ class InMemoryVoteRuntimeAdapter:
         if replay is not None:
             return replay
         state = self._require(command)
+        if state.resolver is not None and state.resolver.departure is not None:
+            raise VoteRuleViolation("DEPARTURE_FINALIZATION_PENDING")
         before = state.game.votes
         state.game.remove_vote(
             game_id=command.game_id,
@@ -204,6 +210,21 @@ class InMemoryVoteRuntimeAdapter:
         if replay is not None:
             return replay
         state = self._require(command)
+        if state.resolver is not None and state.game.turn_status is TurnStatus.VOTING:
+            # The claim is also the pending-work marker; expiry permits takeover,
+            # never a normal close that could race the durable external result.
+            raise VoteRuleViolation("DEPARTURE_FINALIZATION_PENDING")
+        if self._room_lookup is not None:
+            room = await self._room_lookup(command.room_id)
+            state = self._require(command)
+            present = set() if room is None else {item.participant_id for item in room.participants}
+            remaining = {
+                item.team
+                for item in state.game.participants
+                if item.role.value == "PLAYER" and item.participant_id in present
+            }
+            if len(remaining) < 2:
+                raise VoteRuleViolation("DEPARTURE_FINALIZATION_PENDING")
         valid_voter_count = sum(
             item.connected and item.role.value == "PLAYER" and item.team is state.game.current_team
             for item in state.game.participants
@@ -243,6 +264,61 @@ class InMemoryVoteRuntimeAdapter:
         state.resolver = ResolverLease(
             resolution_id=command.resolution_id,
             expires_at_ms=self._clock.now_ms + RESOLVER_LEASE_MS,
+        )
+        return self._remember(command, VoteMutationResult(self._snapshot(command.room_id, state)))
+
+    async def acquire_departure(self, command: AcquireRuntimeDeparture) -> VoteMutationResult:
+        replay = self._replay(command)
+        if replay is not None:
+            return replay
+        state = self._require(command)
+        if state.game.game.status is not GameStatus.ACTIVE:
+            raise VoteRuleViolation("GAME_NOT_ACTIVE")
+        if state.game.turn_status is not TurnStatus.VOTING:
+            raise VoteRuleViolation("TURN_NOT_VOTING")
+        if self._room_lookup is not None and (
+            state.resolver is None or state.resolver.departure is None
+        ):
+            room = await self._room_lookup(command.room_id)
+            state = self._require(command)
+            if room is None:
+                raise VoteRuleViolation("ROOM_NOT_FOUND")
+            if room.status is not RoomStatus.PLAYING or room.game_id != command.game_id:
+                raise VoteRuleViolation("GAME_NOT_IN_CURRENT_ROOM")
+            if room.state_version != command.expected_room_state_version:
+                raise VoteRuleViolation("STATE_VERSION_CONFLICT")
+            present = {item.participant_id for item in room.participants}
+            remaining = {
+                item.team
+                for item in state.game.participants
+                if item.role.value == "PLAYER" and item.participant_id in present
+            }
+            if len(remaining) == 2:
+                raise VoteRuleViolation("FORFEIT_NOT_CONFIRMED")
+            reason = EndReason.FORFEIT if remaining else EndReason.JOINT_LOSS
+            winner = next(iter(remaining)) if remaining else Stone.EMPTY
+            if (command.end_reason, command.winner) != (reason, winner):
+                raise VoteRuleViolation("DEPARTURE_RESULT_CHANGED")
+        current = state.resolver
+        if (
+            current is not None
+            and current.expires_at_ms > self._clock.now_ms
+            and current.resolution_id != command.resolution_id
+        ):
+            raise VoteRuleViolation("RESOLVER_LEASE_HELD")
+        state.resolver = ResolverLease(
+            command.resolution_id,
+            self._clock.now_ms + RESOLVER_LEASE_MS,
+            (
+                current.departure
+                if current is not None and current.departure is not None
+                else DepartureFinalization(
+                    command.end_reason,
+                    command.winner,
+                    state.game.game.move_no,
+                    self._clock.now_ms,
+                )
+            ),
         )
         return self._remember(command, VoteMutationResult(self._snapshot(command.room_id, state)))
 
@@ -288,6 +364,19 @@ class InMemoryVoteRuntimeAdapter:
         state = self._require(command)
         if state.game.turn_no != command.turn_no:
             raise VoteRuleViolation("STALE_TURN")
+        if state.game.turn_status is not TurnStatus.VOTING:
+            raise VoteRuleViolation("TURN_NOT_VOTING")
+        resolver = state.resolver
+        if resolver is None or resolver.resolution_id != command.resolution_id:
+            raise VoteRuleViolation("RESOLVER_NOT_OWNER")
+        if resolver.expires_at_ms <= self._clock.now_ms:
+            raise VoteRuleViolation("RESOLVER_LEASE_EXPIRED")
+        decision = resolver.departure
+        if decision is None or (decision.end_reason, decision.winner) != (
+            command.end_reason,
+            command.winner,
+        ):
+            raise VoteRuleViolation("INVALID_EXTERNAL_GAME_RESULT")
         state.game.finalize_external_result(
             end_reason=command.end_reason,
             winner=command.winner,

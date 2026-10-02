@@ -39,6 +39,8 @@ class InMemoryGamePersistenceAdapter:
         by_turn = await self.get_move(command.game_id, command.turn_no)
         existing = by_turn if by_turn is not None else self.moves.get(key)
         if existing is None:
+            if command.game_id in self.results:
+                raise PersistenceRuleViolation("GAME_STATUS_CONFLICT")
             self.moves[key] = command
             return PersistenceOutcome.CREATED
         if existing == command:
@@ -51,6 +53,15 @@ class InMemoryGamePersistenceAdapter:
             raise PersistenceRuleViolation("GAME_NOT_FOUND")
         existing = self.results.get(game_id)
         if existing is None:
+            if (
+                command.expected_move_no is not None
+                and max(
+                    (item.move_no for item in self.moves.values() if item.game_id == game_id),
+                    default=0,
+                )
+                != command.expected_move_no
+            ):
+                raise PersistenceRuleViolation("GAME_HISTORY_CHANGED")
             # Validate every update before changing any shared Fake state.
             for adjustment in command.result.rating_adjustments:
                 rating = self.member_ratings.get(adjustment.member_id)

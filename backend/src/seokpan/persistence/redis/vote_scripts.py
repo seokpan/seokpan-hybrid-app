@@ -241,9 +241,24 @@ local function eligible(participant_id)
   return item, nil
 end
 
+local function remaining_teams()
+  local black_present = false
+  local white_present = false
+  for _, item in ipairs(game.participants) do
+    if item.role == 'PLAYER' and redis.call('HEXISTS', KEYS[2], item.participant_id) == 1 then
+      if item.team == 'BLACK' then black_present = true end
+      if item.team == 'WHITE' then white_present = true end
+    end
+  end
+  return black_present, white_present
+end
+
 if operation == 'cast_vote' or operation == 'remove_vote' then
   if game.game_status ~= 'ACTIVE' then return rejection('GAME_NOT_ACTIVE') end
   if game.turn_status ~= 'VOTING' then return rejection('TURN_NOT_VOTING') end
+  if redis.call('EXISTS', KEYS[8]) == 1 then
+    return rejection('DEPARTURE_FINALIZATION_PENDING')
+  end
   if time_ms() >= game.deadline_ms then return rejection('TURN_DEADLINE_REACHED') end
   local _, error = eligible(payload.participant_id)
   if error then return rejection(error) end
@@ -273,6 +288,15 @@ end
 if operation == 'close_turn' then
   if game.game_status ~= 'ACTIVE' then return rejection('GAME_NOT_ACTIVE') end
   if game.turn_status ~= 'VOTING' then return rejection('TURN_NOT_VOTING') end
+  -- A VOTING resolver key is a pending terminal intent, even after lease expiry.
+  -- Expiry allows another departure owner; it never reopens normal Turn closing.
+  if redis.call('EXISTS', KEYS[8]) == 1 then
+    return rejection('DEPARTURE_FINALIZATION_PENDING')
+  end
+  local black_present, white_present = remaining_teams()
+  if not black_present or not white_present then
+    return rejection('DEPARTURE_FINALIZATION_PENDING')
+  end
   if time_ms() < game.deadline_ms then return rejection('TURN_DEADLINE_NOT_REACHED') end
   local tally = tally_values()
   local valid_voter_count = 0
@@ -325,16 +349,46 @@ if operation == 'close_turn' then
   }))
 end
 
-if operation == 'acquire_resolver' then
-  if game.turn_status ~= 'RESOLVING' then return rejection('TURN_NOT_RESOLVING') end
+if operation == 'acquire_resolver' or operation == 'acquire_departure' then
+  local departure = operation == 'acquire_departure'
+  if departure then
+    if game.game_status ~= 'ACTIVE' then return rejection('GAME_NOT_ACTIVE') end
+    if game.turn_status ~= 'VOTING' then return rejection('TURN_NOT_VOTING') end
+  elseif game.turn_status ~= 'RESOLVING' then
+    return rejection('TURN_NOT_RESOLVING')
+  end
   local current = decode_or_nil(redis.call('GET', KEYS[8]))
   local now = time_ms()
   if current and current.expires_at_ms > now and current.resolution_id ~= payload.resolution_id then
     return rejection('RESOLVER_LEASE_HELD')
   end
+  local decision = current and current.departure or nil
+  if departure and not decision then
+    -- Select the terminal intent only against the live authoritative Room.
+    -- Closure-before-claim leaves no Room and cannot create a new intent.
+    if redis.call('EXISTS', KEYS[1]) == 0 then return rejection('ROOM_NOT_FOUND') end
+    if redis.call('HGET', KEYS[1], 'status') ~= 'PLAYING'
+        or redis.call('HGET', KEYS[1], 'game_id') ~= game.game_id then
+      return rejection('GAME_NOT_IN_CURRENT_ROOM')
+    end
+    if tonumber(redis.call('HGET', KEYS[1], 'state_version'))
+        ~= payload.expected_room_state_version then return rejection('STATE_VERSION_CONFLICT') end
+    local black_present, white_present = remaining_teams()
+    if black_present and white_present then return rejection('FORFEIT_NOT_CONFIRMED') end
+    local reason = not black_present and not white_present and 'JOINT_LOSS' or 'FORFEIT'
+    local winner = not black_present and not white_present and 'EMPTY'
+        or (black_present and 'BLACK' or 'WHITE')
+    if payload.end_reason ~= reason or payload.winner ~= winner then
+      return rejection('DEPARTURE_RESULT_CHANGED')
+    end
+    decision = {
+      end_reason = reason, winner = winner, expected_move_no = game.move_no, ended_at_ms = now
+    }
+  end
   local resolver = {
     resolution_id = payload.resolution_id,
-    expires_at_ms = now + resolver_lease_ms
+    expires_at_ms = now + resolver_lease_ms,
+    departure = decision
   }
   redis.call('SET', KEYS[8], cjson.encode(resolver))
   return remember(response({snapshot = snapshot(game)}))
@@ -415,6 +469,16 @@ if operation == 'finalize_game' then
     end
     return rejection('GAME_ALREADY_FINISHED')
   end
+  if game.turn_status ~= 'VOTING' then return rejection('TURN_NOT_VOTING') end
+  local resolver = decode_or_nil(redis.call('GET', KEYS[8]))
+  if not resolver or resolver.resolution_id ~= payload.resolution_id then
+    return rejection('RESOLVER_NOT_OWNER')
+  end
+  if resolver.expires_at_ms <= time_ms() then return rejection('RESOLVER_LEASE_EXPIRED') end
+  if not resolver.departure or resolver.departure.end_reason ~= payload.end_reason
+      or resolver.departure.winner ~= payload.winner then
+    return rejection('INVALID_EXTERNAL_GAME_RESULT')
+  end
   local valid = (payload.end_reason == 'FORFEIT'
       and (payload.winner == 'BLACK' or payload.winner == 'WHITE'))
       or ((payload.end_reason == 'JOINT_LOSS' or payload.end_reason == 'SYSTEM_INVALID')
@@ -436,7 +500,7 @@ return rejection('VOTE_OPERATION_INVALID')
 
 VOTE_MUTATION = VersionedLuaScript(
     name="vote-runtime-mutation",
-    version=8,
+    version=9,
     source=_COMMON + _MUTATION,
 )
 

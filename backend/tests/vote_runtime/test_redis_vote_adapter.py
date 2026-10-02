@@ -29,7 +29,8 @@ def test_vote_keyspace_uses_one_room_hash_tag() -> None:
     assert "return remember(response({" in VOTE_MUTATION.source
     assert "state_version = payload.expected_state_version + 1" in VOTE_MUTATION.source
     assert "game.state_version = current_version(game) + 1" in VOTE_MUTATION.source
-    assert "HGET', KEYS[1], 'state_version'" not in VOTE_MUTATION.source
+    assert "current_version(game) == payload.expected_state_version" in VOTE_MUTATION.source
+    assert "payload.expected_room_state_version" in VOTE_MUTATION.source
     assert "'status') ~= 'PLAYING'" in VOTE_MUTATION.source
     assert "'game_id') ~= payload.game_id" in VOTE_MUTATION.source
 
@@ -255,7 +256,7 @@ def test_old_or_future_vote_snapshot_is_not_interpreted(version: int) -> None:
 
 
 def test_last_move_lua_write_is_persistence_gated_and_readable() -> None:
-    assert VOTE_MUTATION.version == 8
+    assert VOTE_MUTATION.version == 9
     assert VOTE_READ.version == 5
     assert VOTE_MUTATION.source.index("existing.schema_version ~= 3") < VOTE_MUTATION.source.index(
         "local expired"

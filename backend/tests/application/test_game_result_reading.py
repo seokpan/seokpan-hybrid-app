@@ -18,10 +18,12 @@ from seokpan.game.application import (
     PersistenceRuleViolation,
     StartGameCommand,
 )
+from seokpan.game.application.history import replay_game_history
 from seokpan.game.domain import (
     Coordinate,
     EndReason,
     GameResult,
+    GameResultService,
     GameStatus,
     MemberOutcome,
     RatingAdjustment,
@@ -126,9 +128,9 @@ async def test_state_reference_points_to_result_after_finish() -> None:
     assert await service.current_state_reference(SESSION) == (None, None)
 
 
-async def setup_result() -> tuple[
-    GameApplicationService, Mock, InMemoryGamePersistenceAdapter, Mock
-]:
+async def setup_result(
+    *, finalize_result: bool = True
+) -> tuple[GameApplicationService, Mock, InMemoryGamePersistenceAdapter, Mock]:
     games = InMemoryGamePersistenceAdapter({1: 1000, 2: 1000})
     await games.start_game(
         StartGameCommand(
@@ -142,23 +144,23 @@ async def setup_result() -> tuple[
             ),
         )
     )
-    await games.finalize_game(
-        FinalizeGameCommand(
-            GameResult(
-                GAME,
-                GameStatus.FINISHED,
-                EndReason.JOINT_LOSS,
-                Stone.EMPTY,
-                (),
-                True,
-                (
-                    RatingAdjustment(BLACK, 1, Stone.BLACK, MemberOutcome.LOSS, 1000, -16, 984),
-                    RatingAdjustment(WHITE, 2, Stone.WHITE, MemberOutcome.LOSS, 1000, -16, 984),
-                ),
+    command = FinalizeGameCommand(
+        GameResult(
+            GAME,
+            GameStatus.FINISHED,
+            EndReason.JOINT_LOSS,
+            Stone.EMPTY,
+            (),
+            True,
+            (
+                RatingAdjustment(BLACK, 1, Stone.BLACK, MemberOutcome.LOSS, 1000, -16, 984),
+                RatingAdjustment(WHITE, 2, Stone.WHITE, MemberOutcome.LOSS, 1000, -16, 984),
             ),
-            NOW,
-        )
+        ),
+        NOW,
     )
+    if finalize_result:
+        await games.finalize_game(command)
     rooms = Mock(spec=RoomApplicationService)
     rooms.participation.return_value = RoomParticipation(
         SESSION.session_digest,
@@ -298,17 +300,17 @@ async def test_result_rejects_missing_unauthorized_or_incomplete_state(
         games.results.clear()
         games.member_ratings.clear()
     else:
-        await games.append_move(
-            OfficialMoveRecord(
-                GAME,
-                1,
-                2,
-                Stone.BLACK,
-                Coordinate.parse("A1"),
-                1,
-                1,
-                NOW,
-            )
+        # Deliberately corrupt persisted storage, rather than asking the write
+        # adapter to append a new Move to an already finalized Game.
+        games.moves[GAME, 2] = OfficialMoveRecord(
+            GAME,
+            1,
+            2,
+            Stone.BLACK,
+            Coordinate.parse("A1"),
+            1,
+            1,
+            NOW,
         )
     with pytest.raises((RoomRuleViolation, PersistenceRuleViolation), match=code):
         await service.get_result(session=SESSION, game_id=GAME)
@@ -364,7 +366,7 @@ async def test_result_during_room_completion_requires_finished_matching_runtime(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("extra_turn", [False, True])
 async def test_normal_win_replays_board_and_requires_exact_final_turn(extra_turn: bool) -> None:
-    service, rooms, games, _ = await setup_result()
+    service, rooms, games, _ = await setup_result(finalize_result=False)
     for move_no, coordinate in enumerate(
         ("A1", "A15", "B1", "C15", "C1", "E15", "D1", "G15", "E1"), 1
     ):
@@ -381,23 +383,14 @@ async def test_normal_win_replays_board_and_requires_exact_final_turn(extra_turn
             )
         )
     rooms.get.return_value = replace(rooms.get.return_value, last_game_turn_no=9 + int(extra_turn))
-    command = games.results[GAME]
-    games.results[GAME] = replace(
-        command,
-        result=replace(
-            command.result,
-            end_reason=EndReason.BLACK_WIN,
-            winner=Stone.BLACK,
-            rating_adjustments=(
-                replace(
-                    command.result.rating_adjustments[0],
-                    outcome=MemberOutcome.WIN,
-                    rating_delta=16,
-                    rating_after=1016,
-                ),
-                command.result.rating_adjustments[1],
-            ),
-        ),
+    history = await games.load_game(GAME)
+    await games.finalize_game(
+        FinalizeGameCommand(
+            GameResultService(
+                game_id=GAME, game=replay_game_history(history), participants=history.participants
+            ).finalize_completed_game(),
+            NOW,
+        )
     )
     if extra_turn:
         with pytest.raises(PersistenceRuleViolation, match="GAME_RESULT_HISTORY_MISMATCH"):
