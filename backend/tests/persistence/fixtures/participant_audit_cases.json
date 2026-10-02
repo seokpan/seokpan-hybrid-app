@@ -1,0 +1,384 @@
+{
+  "purpose": "Synthetic inputs and expected findings for an explicitly approved isolated MariaDB test. Never load into the project Runtime database.",
+  "format_cases": [
+    {
+      "name": "normal_guest",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": false,
+      "identity_finding": false
+    },
+    {
+      "name": "normal_member",
+      "is_guest": 0,
+      "member_id": 1,
+      "guest_label": null,
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": false,
+      "identity_finding": false
+    },
+    {
+      "name": "guest_null_label",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": null,
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "guest_lowercase",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "guest_newline",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001\n",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "guest_space",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001 ",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "guest_non_ascii",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-１２３４",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "guest_with_member",
+      "is_guest": 1,
+      "member_id": 1,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "member_missing_member",
+      "is_guest": 0,
+      "member_id": null,
+      "guest_label": null,
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "member_with_label",
+      "is_guest": 0,
+      "member_id": 1,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "invalid_kind",
+      "is_guest": 2,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "null_kind",
+      "is_guest": null,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001",
+      "combination_finding": true,
+      "identity_finding": false
+    },
+    {
+      "name": "null_identity",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": null,
+      "combination_finding": false,
+      "identity_finding": false
+    },
+    {
+      "name": "uppercase_identity",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "ABCDEFAB-0000-4000-8000-000000000001",
+      "combination_finding": false,
+      "identity_finding": true
+    },
+    {
+      "name": "non_v4_identity",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-1000-8000-000000000001",
+      "combination_finding": false,
+      "identity_finding": true
+    },
+    {
+      "name": "bad_variant_identity",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-7000-000000000001",
+      "combination_finding": false,
+      "identity_finding": true
+    },
+    {
+      "name": "short_identity",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "not-a-uuid",
+      "combination_finding": false,
+      "identity_finding": true
+    },
+    {
+      "name": "identity_newline",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "00000000-0000-4000-8000-000000000001\n",
+      "combination_finding": false,
+      "identity_finding": true
+    },
+    {
+      "name": "empty_identity",
+      "is_guest": 1,
+      "member_id": null,
+      "guest_label": "Guest-0001",
+      "participant_id": "",
+      "combination_finding": false,
+      "identity_finding": true
+    }
+  ],
+  "set_cases": [
+    {
+      "name": "empty",
+      "games": [],
+      "participants": [],
+      "expected_active": [],
+      "expected_member_duplicates": [],
+      "expected_guest_duplicates": [],
+      "expected_identity_duplicates": []
+    },
+    {
+      "name": "active_zero",
+      "games": [
+        {
+          "game_id": "g1",
+          "status": "IN_PROGRESS"
+        }
+      ],
+      "participants": [],
+      "expected_active": [
+        [
+          "g1",
+          0,
+          0
+        ]
+      ],
+      "expected_member_duplicates": [],
+      "expected_guest_duplicates": [],
+      "expected_identity_duplicates": []
+    },
+    {
+      "name": "active_mixed",
+      "games": [
+        {
+          "game_id": "g1",
+          "status": "IN_PROGRESS"
+        }
+      ],
+      "participants": [
+        {
+          "id": 1,
+          "game_id": "g1",
+          "is_guest": 0,
+          "member_id": 1,
+          "guest_label": null,
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "id": 2,
+          "game_id": "g1",
+          "is_guest": 1,
+          "member_id": null,
+          "guest_label": "Guest-0001",
+          "participant_id": null
+        }
+      ],
+      "expected_active": [
+        [
+          "g1",
+          2,
+          1
+        ]
+      ],
+      "expected_member_duplicates": [],
+      "expected_guest_duplicates": [],
+      "expected_identity_duplicates": []
+    },
+    {
+      "name": "same_game_duplicates",
+      "games": [
+        {
+          "game_id": "g1",
+          "status": "IN_PROGRESS"
+        }
+      ],
+      "participants": [
+        {
+          "id": 1,
+          "game_id": "g1",
+          "is_guest": 0,
+          "member_id": 1,
+          "guest_label": null,
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "id": 2,
+          "game_id": "g1",
+          "is_guest": 0,
+          "member_id": 1,
+          "guest_label": null,
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "id": 3,
+          "game_id": "g1",
+          "is_guest": 1,
+          "member_id": null,
+          "guest_label": "Guest-0001",
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "id": 4,
+          "game_id": "g1",
+          "is_guest": 1,
+          "member_id": null,
+          "guest_label": "Guest-0001",
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        }
+      ],
+      "expected_active": [
+        [
+          "g1",
+          4,
+          0
+        ]
+      ],
+      "expected_member_duplicates": [
+        [
+          "g1",
+          1,
+          2
+        ]
+      ],
+      "expected_guest_duplicates": [
+        [
+          "g1",
+          "Guest-0001",
+          2
+        ]
+      ],
+      "expected_identity_duplicates": [
+        [
+          "g1",
+          "00000000-0000-4000-8000-000000000001",
+          4
+        ]
+      ]
+    },
+    {
+      "name": "different_games",
+      "games": [
+        {
+          "game_id": "g1",
+          "status": "IN_PROGRESS"
+        },
+        {
+          "game_id": "g2",
+          "status": "IN_PROGRESS"
+        }
+      ],
+      "participants": [
+        {
+          "id": 1,
+          "game_id": "g1",
+          "is_guest": 0,
+          "member_id": 1,
+          "guest_label": null,
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "id": 2,
+          "game_id": "g2",
+          "is_guest": 0,
+          "member_id": 1,
+          "guest_label": null,
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        }
+      ],
+      "expected_active": [
+        [
+          "g1",
+          1,
+          0
+        ],
+        [
+          "g2",
+          1,
+          0
+        ]
+      ],
+      "expected_member_duplicates": [],
+      "expected_guest_duplicates": [],
+      "expected_identity_duplicates": []
+    },
+    {
+      "name": "completed_game",
+      "games": [
+        {
+          "game_id": "g1",
+          "status": "COMPLETED"
+        }
+      ],
+      "participants": [
+        {
+          "id": 1,
+          "game_id": "g1",
+          "is_guest": 0,
+          "member_id": 1,
+          "guest_label": null,
+          "participant_id": "00000000-0000-4000-8000-000000000001"
+        }
+      ],
+      "expected_active": [],
+      "expected_member_duplicates": [],
+      "expected_guest_duplicates": [],
+      "expected_identity_duplicates": []
+    }
+  ]
+}

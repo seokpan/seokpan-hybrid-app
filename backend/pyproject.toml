@@ -1,0 +1,58 @@
+[project]
+name = "seokpan-backend"
+version = "0.1.0"
+description = "Backend application for the Seokpan MVP"
+requires-python = "==3.13.15"
+dependencies = [
+    "alembic==1.19.1",
+    "argon2-cffi==25.1.0",
+    "asyncmy==0.2.14",
+    "fastapi==0.141.1",
+    "prometheus-client==0.26.0",
+    "pydantic-settings==2.15.0",
+    "redis==8.1.0",
+    "sqlalchemy[asyncio]==2.0.52",
+    "uvicorn==0.52.4",
+    "websockets==17.1",
+]
+
+[project.scripts]
+seokpan-migration-gate = "seokpan.persistence.mariadb.migration_gate:main"
+
+[dependency-groups]
+dev = [
+    "httpx2==2.12.0",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.5",
+]
+
+[build-system]
+requires = ["uv-build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = "==0.12.5"
+
+[tool.uv.build-backend]
+module-name = "seokpan"
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src"
+packages = ["seokpan"]

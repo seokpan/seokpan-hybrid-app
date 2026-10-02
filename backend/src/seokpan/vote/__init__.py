@@ -1,0 +1,1 @@
+"""Vote domain package."""

@@ -1,0 +1,195 @@
+.rankings {
+  max-width: 1080px;
+  margin-inline: auto;
+}
+.hint {
+  display: inline-block;
+  background: #f0f3fa;
+  padding: 0.65rem 0.85rem;
+  border-radius: 0.45rem;
+  color: #52617a;
+  margin: 0.25rem 0;
+}
+.feedback {
+  min-height: 2.8rem;
+  font-size: 0.9rem;
+}
+.tableFrame {
+  min-height: 22rem;
+  border: 1px solid #dce3ef;
+  border-radius: 0.45rem;
+  overflow-x: auto;
+}
+.rankings .table {
+  min-width: 0;
+  table-layout: fixed;
+  text-align: center;
+}
+.table th:nth-child(2) {
+  width: 26%;
+}
+.table th:nth-child(3) {
+  width: 17%;
+}
+.table th:last-child {
+  width: 15%;
+}
+.table td,
+.table th {
+  font-variant-numeric: tabular-nums;
+}
+.ownRow {
+  background: #effbfe;
+}
+.meTag {
+  display: inline-block;
+  color: #006f7d;
+  font-size: 0.7rem;
+  border: 1px solid #8ac9d1;
+  border-radius: 0.25rem;
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.25rem;
+}
+.medal {
+  display: inline-grid;
+  place-items: center;
+  width: 1.65rem;
+  height: 1.65rem;
+  border-radius: 50%;
+  background: #fff1b8;
+  border: 2px solid #d2a22a;
+  color: #503400;
+  font-weight: 700;
+}
+.medal[data-rank="2"] {
+  background: #edf0f4;
+  border-color: #9aa8b9;
+  color: #364257;
+}
+.medal[data-rank="3"] {
+  background: #f8e6d9;
+  border-color: #b78154;
+  color: #684022;
+}
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 1rem;
+  margin: 1rem 0;
+}
+.myRank {
+  background: #effbfe;
+  border: 1px solid #a0d8e5;
+  border-radius: 0.5rem;
+  padding: 1rem 1.5rem;
+}
+.ownHeading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 1rem;
+  color: #006c7f;
+}
+.ownHeading h2 {
+  font-size: 1.1rem;
+  margin-bottom: 0.4rem;
+}
+.rating {
+  margin: 0.6rem 0;
+  font-variant-numeric: tabular-nums;
+}
+.record {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 0.6rem 0;
+  font-variant-numeric: tabular-nums;
+}
+.record div {
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+}
+.record dd {
+  font-weight: 700;
+  margin: 0;
+}
+.record dt {
+  font-size: 0.85rem;
+  color: #52617a;
+}
+.sortHelp {
+  color: #52617a;
+  font-size: 0.85rem;
+  margin-block: 1.25rem;
+  line-height: 1.6;
+}
+.back {
+  display: block;
+  width: fit-content;
+  text-align: center;
+  margin: 1rem auto 0;
+  text-decoration: none;
+}
+.userMenu {
+  position: relative;
+  max-width: 100%;
+}
+.popover {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 0.85rem);
+  right: 0;
+  width: min(310px, calc(100vw - 2rem));
+  padding: 1.15rem;
+  background: white;
+  color: #112343;
+  border: 1px solid #dce3ef;
+  border-radius: 0.85rem;
+  box-shadow: 0 12px 40px #08163733;
+  line-height: 1.6;
+}
+.popover h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.15rem;
+  overflow-wrap: anywhere;
+}
+.popover small {
+  font-size: 0.7rem;
+  font-weight: 400;
+  border-radius: 0.4rem;
+  padding: 0.25rem 0.4rem;
+  background: #f0f3fa;
+}
+.popover button {
+  color: #123c78;
+  background: white;
+  border-color: #8b9fbe;
+  min-height: 44px;
+}
+.popover .logout {
+  width: 100%;
+  margin-top: 0.8rem;
+  border-top-width: 1px;
+}
+@media (max-width: 600px) {
+  .rankings {
+    padding: 1rem 0.65rem;
+  }
+  .rankings .table th,
+  .rankings .table td {
+    font-size: 0.75rem;
+    padding: 0.7rem 0.2rem;
+  }
+  .table th:nth-child(2) {
+    width: 24%;
+  }
+  .myRank {
+    padding: 0.8rem;
+  }
+  .medal {
+    width: 1.35rem;
+    height: 1.35rem;
+  }
+}
