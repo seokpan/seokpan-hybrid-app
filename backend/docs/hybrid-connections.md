@@ -7,7 +7,7 @@
 | 환경변수 | 계약 |
 | --- | --- |
 | `SEOKPAN_CONNECTION_PROFILE` | `legacy`가 기본. `cloud`, `lab`, `recovery`는 아래 명시적 대상 입력을 요구한다. Profile은 배포 환경의 표지이며 실제 환경/계정/Endpoint를 자동 발견하지 않는다. |
-| `SEOKPAN_DATABASE_EXPECTED_HOST` | 승인 DB의 정확한 DNS Host 또는 IPv4. URL Host와 일치해야 하며 서버 인증서 SAN도 해당 Host를 포함해야 한다. |
+| `SEOKPAN_DATABASE_EXPECTED_HOST` | 승인 DB의 정확한 DNS Host 또는 IPv4. URL Host와 일치해야 하며 서버 인증서는 해당 Host에 유효해야 한다. |
 | `SEOKPAN_DATABASE_EXPECTED_PORT` | 승인 TCP Port, 1~65535. 비legacy에서 기본값으로 대신하지 않는다. |
 | `SEOKPAN_DATABASE_EXPECTED_NAME` | 정확한 DB 이름. 영문·숫자·밑줄, 최대 64자. |
 | `SEOKPAN_IDENTITY_DATABASE_URL` | `mysql+asyncmy://identity_svc:<별도 공급 비밀번호>@<승인 Host>:<Port>/<DB>` |
@@ -23,6 +23,8 @@
 
 실제 URL/Secret 값은 Git에 기록하지 않는다. DB URL의 비밀번호는 URL 인코딩하고 기존처럼 Secret으로 공급한다. DB URL 옵션은 없거나 정확히 `charset=utf8mb4` 하나만 허용한다. Redis는 URL 인증을 계속 금지하고 별도 AUTH Token만 사용한다. Settings의 repr와 구성 오류는 URL/비밀번호/AUTH/입력 Host·CA 경로를 표시하지 않는다.
 
+DB·Redis의 Hostname 검증은 현재 Python의 기본 TLS 검증을 유지하며, SAN이 없는 인증서에 대한 CN fallback도 포함한다. SAN-only 정책을 추가한 것은 아니다. lab/recovery 인증서는 실제 승인 Host를 SAN에 포함해 공급하고, CA/서버 인증서의 유효기간과 해당 Host에서의 검증 결과를 실제 실행 입력으로 확인한다. 로컬 합성 인증서 시험은 실제 환경의 인증서·수명·공급 경로 확인을 대신하지 않는다.
+
 Migration CLI의 `--expect-host`, `--expect-port`, `--expect-database`는 환경 설정의 승인 대상을 대체하지 않는다. URL이 **CLI 기대 대상과 환경 설정 대상 모두**에 일치해야 한다. 직접 Alembic online/offline과 App Runtime도 같은 대상 검사를 사용한다. 기존 one-shot 승인·실행 절차, 온라인 CA 필수, offline SQL 생성의 네트워크 비의존을 유지한다.
 
 ## 환경 경계
@@ -37,7 +39,7 @@ Migration CLI의 `--expect-host`, `--expect-port`, `--expect-database`는 환경
 
 검증 Runtime은 저장소의 `uv==0.12.5`, Python `3.13.15`, frozen `uv.lock` 전체다. `redis==8.1.0`, `asyncmy==0.2.14`를 포함한 의존 버전을 바꾸지 않았다.
 
-2026-10-02 로컬 검사 결과: 전체 pytest **1,724 통과**, 신규 hybrid 검사 **54 통과**, 전체 ruff 검사/format 검사 통과, mypy **119 Source 파일 통과**. 독립 검토에서 DB CA 경로가 Settings repr에 표시되는 점을 발견해 Runtime/Migration 양쪽에서 숨기고 해당 기존·신규 시험을 다시 확인했다. 이 숫자는 App 로컬 코드 검사 결과이며 Cloud/lab/Recovery의 Acceptance 결과가 아니다.
+2026-10-02 최종 로컬 검사 결과: 전체 pytest **1,728 통과**, 신규 hybrid 검사 **58 통과**, 전체 ruff 검사/format 검사 통과, mypy **119 Source 파일 통과**. 최초 검사 1,724/54 이후 CA 경로 repr를 보완했고, 이번 재귀 검토에서 빈 Fragment로 URL 검사와 Driver의 charset 해석이 달라지는 경우를 거부하도록 보완했다. 정상 URL 인코딩 비밀번호는 유지하며 관련 155개와 최종 전체 회귀를 통과했다. 이 숫자는 App 로컬 코드 검사 결과이며 Cloud/lab/Recovery의 Acceptance 결과가 아니다.
 
 ```sh
 uv sync --frozen --all-groups

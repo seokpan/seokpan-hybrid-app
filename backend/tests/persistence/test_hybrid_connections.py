@@ -105,6 +105,8 @@ def test_missing_db_target_fails_before_engine_creation(field: str) -> None:
         DB_URL + "?ssl=false",
         DB_URL + "?charset=utf8mb4&charset=utf8mb4",
         DB_URL + "#private-fragment",
+        DB_URL + "#",
+        DB_URL + "?charset=utf8mb4#",
     ],
 )
 def test_hybrid_db_mismatch_is_redacted(raw: str) -> None:
@@ -113,8 +115,21 @@ def test_hybrid_db_mismatch_is_redacted(raw: str) -> None:
     assert all(value not in str(error.value) for value in ["synthetic", "sensitive", DB_HOST])
 
 
+@pytest.mark.parametrize(
+    ("database_url", "password", "charset"),
+    [
+        (DB_URL, "synthetic-only", None),
+        (
+            DB_URL.replace("synthetic-only", "synthetic%23only") + "?charset=utf8mb4",
+            "synthetic#only",
+            "utf8mb4",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_actual_asyncmy_engine_arguments_match_runtime_and_migration() -> None:
+async def test_actual_asyncmy_engine_arguments_match_runtime_and_migration(
+    database_url: str, password: str, charset: str | None
+) -> None:
     class BeforeNetwork(Exception):
         pass
 
@@ -127,13 +142,15 @@ async def test_actual_asyncmy_engine_arguments_match_runtime_and_migration() -> 
         raise BeforeNetwork
 
     configured = settings()
+    configured.identity_database_url = database_url
+    configured.game_database_url = database_url.replace("identity_svc", "game_svc")
     migration = create_migration_engine(
         MigrationSettings(
             connection_profile="cloud",
             database_expected_host=DB_HOST,
             database_expected_port=3307,
             database_expected_name="approved_game",
-            migration_database_url=DB_URL.replace("identity_svc", "db_admin"),
+            migration_database_url=database_url.replace("identity_svc", "db_admin"),
             database_ca_file=str(CA),
         )
     )
@@ -148,6 +165,8 @@ async def test_actual_asyncmy_engine_arguments_match_runtime_and_migration() -> 
     assert [item["user"] for item in observed] == ["identity_svc", "game_svc", "db_admin"]
     for item in observed:
         assert (item["host"], item["port"], item["db"]) == (DB_HOST, 3307, "approved_game")
+        assert item["password"] == password
+        assert item.get("charset") == charset
         context = item["ssl"]
         assert isinstance(context, ssl.SSLContext)
         assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
@@ -195,6 +214,7 @@ def test_environment_target_is_not_bypassed_by_migration_cli(
         REDIS_URL.replace("/0", "/1"),
         REDIS_URL + "?ssl_check_hostname=false",
         REDIS_URL + "#sensitive-value",
+        REDIS_URL + "#",
         REDIS_URL + "\n",
     ],
 )

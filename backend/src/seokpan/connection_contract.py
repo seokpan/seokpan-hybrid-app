@@ -61,7 +61,12 @@ def parse_hybrid_redis_url(
     approved_host, approved_port = _host(host), _port(port)
     if isinstance(database, bool) or not isinstance(database, int) or database != 0:
         raise ConnectionContractError("approved Redis database must be zero")
-    if not raw or raw != raw.strip() or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+    if (
+        not raw
+        or "#" in raw
+        or raw != raw.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)
+    ):
         raise ConnectionContractError("Redis URL is missing or malformed")
     try:
         parts = urlsplit(raw)

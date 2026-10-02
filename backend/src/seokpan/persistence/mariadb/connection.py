@@ -57,7 +57,7 @@ def configured_database_target(settings: DatabaseTargetSettings) -> DatabaseTarg
 def validated_database_url(
     raw_url: str | None, account: DatabaseAccount, target: DatabaseTarget | None = None
 ) -> URL:
-    if not raw_url or any(ord(char) < 32 or ord(char) == 127 for char in raw_url):
+    if not raw_url or "#" in raw_url or any(ord(char) < 32 or ord(char) == 127 for char in raw_url):
         raise DatabaseConfigurationError("database URL is missing or malformed")
     try:
         parts = urlsplit(raw_url)
@@ -67,7 +67,7 @@ def validated_database_url(
     except (ValueError, TypeError, SQLAlchemyError):
         raise DatabaseConfigurationError("database URL is malformed") from None
 
-    if parts.fragment or query not in ([], [("charset", "utf8mb4")]):
+    if query not in ([], [("charset", "utf8mb4")]):
         raise DatabaseConfigurationError("database URL options are not permitted")
     if url.drivername != DATABASE_DRIVER:
         raise DatabaseConfigurationError(f"database URL must use {DATABASE_DRIVER}")
