@@ -1,0 +1,32 @@
+.presence {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 9.6rem;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+.dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: #8290a4;
+}
+.dot[data-connected="true"] {
+  background: #35bb99;
+}
+.presence button {
+  width: auto;
+  min-width: 1.6rem;
+  min-height: 1.6rem;
+  padding: 0.1rem 0.3rem;
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 0.25rem;
+}
+.presence button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
