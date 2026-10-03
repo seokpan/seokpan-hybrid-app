@@ -19,3 +19,9 @@
 1차 Image Pipeline은 기존 Harbor 프로젝트와 `seokpan-gitops`를 대상으로 한다. 이관본의 루트 Image Pipeline 진입점은 CI #2 전환이 완료될 때까지 즉시 중단한다. 원본은 `reference/phase1-ci/Jenkinsfile.image-pipeline`에 그대로 보존하며 실행 Job으로 등록하지 않는다. 1차 Pipeline·Job·공유 Template은 변경하지 않았다.
 
 이관 이후 Source 수정은 App #1의 환경별 대상 검사와 Redis TLS·별도 AUTH 계약, 별도 App #4 TH-14 검토로 재현한 Turn/Departure 종료 경쟁 보완이다. 연결 구현 당시 검사는 [연결 계약](backend/docs/hybrid-connections.md), 뒤의 공유 최종화 예약·DB 보호·재시도와 제한된 회귀는 [Turn/Departure 최종화](backend/docs/turn-departure-finalization.md)에서 구분한다. Dependency/Lock·게임 Lifecycle 모드 선택·DB Schema·실제 Redis Runtime 배치·Cloud 생성/삭제·목표 RTO/RPO를 변경하지 않는다. Source 검사는 실제 다중 Pod 업무 시험과 Image·배포·복구 수락을 대신하지 않는다.
+
+## 2026-10-03 원격 게시와 이력 보존
+
+사용자가 전체 Bundle을 작업 브랜치로 전송했고, 원격 `c837120c25c34b88bf6c6ee8e122ff50cbff062d`의 Tree·390개 파일과 전체 78개 Commit 이력을 확인했습니다. 초기 이관 Commit `c7a452d514742f77abd2c49c5836566df7386550`의 두 부모는 위 2차 초기 main과 고정 1차 Seed입니다.
+
+main의 보호 규칙은 승인 1명과 Squash 병합을 요구합니다. 원본 이력은 같은 저장소의 [reference/app-migration-history-20261002](https://github.com/seokpan/seokpan-hybrid-app/tree/reference/app-migration-history-20261002)를 위 c837 Commit에 고정해 보존합니다. 이 reference를 이동하거나 일괄 Branch 정리에서 삭제하지 않습니다. 일반 작업 브랜치는 리뷰·병합 후 정리할 수 있지만, main의 Squash Commit과 reference의 원본 계보는 구분합니다. 이 정책 연결은 App 코드·Schema·Dependency·검사 결과나 실제 Image/복구 상태를 변경하지 않습니다.
