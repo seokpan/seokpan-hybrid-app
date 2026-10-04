@@ -1,0 +1,8 @@
+# Generated API types are checked against the Backend export, not reformatted.
+src/api/schema.d.ts
+package-lock.json
+node_modules/
+dist/
+.browser-cache/
+test-results/
+coverage/

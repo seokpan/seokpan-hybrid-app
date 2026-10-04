@@ -1,0 +1,16 @@
+# 작성자: 최유준 / 작성 날짜: 2026-09-04 (v2 - PR #48 확정 스펙 반영)
+# [정정] migrations/audit/는 제외하지 않음 (팀 확정: migrations/ 전체를 Image에 포함)
+tests/
+docs/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
+*.egg-info/
+.coverage
+htmlcov/

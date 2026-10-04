@@ -1,0 +1,1198 @@
+// ============================================================================
+// seokpan-app :: main Image Pipeline
+//
+// Issue #58 P2:
+//   main Commit
+//     -> P1 Revalidation
+//     -> Backend/Frontend Candidate Build + native SBOM/Provenance
+//     -> Candidate Push-time Digest
+//     -> Trivy Scan
+//     -> Candidate Health Process Smoke
+//     -> Final git-* Promote
+//     -> Final Digest Verify
+//     -> Candidate scan-* Tag-only Cleanup
+//     -> image-metadata.json Evidence
+//
+// Fail-closed:
+//   - PR context / non-main 실행 금지
+//   - P1 실패 시 Image 작업 금지
+//   - CRITICAL 또는 fixable HIGH 발견 시 Promote 금지
+//   - Candidate Health Smoke 실패 시 Promote 금지
+//   - Harbor API / Guard / Digest 오류 시 중단
+//
+// GitOps Promotion (#98):
+//   검증된 Final Digest 확정 뒤 별도 app-ci-check Agent에서
+//   component provenance/impact를 판정하고 seokpan-gitops PR 생성까지 자동화한다.
+//   GitOps main 직접 push/auto-merge/Cluster 직접 변경은 하지 않는다.
+//
+// Health Smoke:
+//   target 컨테이너 내부 Jenkins Durable Task(sh)는 실제 Tmp Job에서
+//   실패가 재현되어 사용하지 않는다.
+//   원래 CMD로 기동된 target을 같은 Pod의 checker가
+//   /health/live HTTP 200으로 검증한다.
+//
+// Retention:
+//   현재 Harbor seokpan Project Retention은 미구성.
+//   별도 seokpan-infra 후속 범위에서 결정한다.
+// ============================================================================
+
+def COMPONENT_REPO = [
+    backend : 'backend',
+    frontend: 'frontend'
+]
+
+// Health Smoke 대상 설정값 (docs/ci-verification.md 기준 고정값)
+def HEALTH_CFG = [
+    backend : [port: 8000, uid: 10001, path: '/health/live'],
+    frontend: [port: 8080, uid: 101,   path: '/health/live']
+]
+
+pipeline {
+    agent none
+
+    options {
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+        disableRestartFromStage()
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        HARBOR_HOST     = 'harbor.seokpan.soldesk.store'
+        HARBOR_PROJECT  = 'seokpan'
+        HARBOR_API_CRED = 'harbor-api-robot-account'
+        HARBOR_CA_PATH  = '/etc/buildkit/certs/ca.crt'
+    }
+
+    stages {
+
+        // --------------------------------------------------------------
+        // Branch Guard + 변수 준비. 가벼운 작업이라 buildkit-rootless를
+        // 재사용(별도 lightweight agent 추가하지 않음).
+        // --------------------------------------------------------------
+        stage('Branch Guard & Prepare') {
+            agent { kubernetes { inheritFrom 'buildkit-rootless' } }
+            steps {
+                script {
+                    if (env.CHANGE_ID) {
+                        error("이 Pipeline은 PR 컨텍스트(CHANGE_ID=${env.CHANGE_ID})에서 실행되면 안 됩니다.")
+                    }
+                    if (env.BRANCH_NAME != 'main') {
+                        error("이 Pipeline은 main 브랜치 전용입니다 (현재 BRANCH_NAME=${env.BRANCH_NAME}).")
+                    }
+                    echo "Branch Guard 통과: BRANCH_NAME=main, PR 컨텍스트 아님"
+
+                    // [수정, App Jenkinsfile v3.1 대조 반영] sh('git rev-parse HEAD') 대신
+                    // checkout scm의 반환값을 사용. 환경변수 이름도 App 쪽 검사 스크립트가
+                    // 실제로 참조하는 계약(SEOKPAN_GIT_SHA / SEOKPAN_CI_RUN_ID)과 정확히
+                    // 맞춤 — 임의로 다른 이름(RUN_ID 등)을 쓰면 verify_ci.py/verify:ci 등이
+                    // 내부적으로 기대하는 값과 어긋날 위험이 있음.
+                    def scmVars = checkout scm
+                    env.SEOKPAN_GIT_SHA   = scmVars.GIT_COMMIT
+                    // App 쪽과 동일한 "a09-<build>-<sha12>" 컨벤션 그대로 사용. 이 Job은
+                    // App CI Check Job과 완전히 별도 Workspace(별도 Job)라 test-results/
+                    // 경로 충돌 위험 자체가 없으므로, 접두사를 굳이 분리할 이유가 없음.
+                    env.SEOKPAN_CI_RUN_ID = "a09-${env.BUILD_NUMBER}-${env.SEOKPAN_GIT_SHA.take(12)}"
+                    env.MAIN_SHA_12    = env.SEOKPAN_GIT_SHA.take(12)
+                    env.CANDIDATE_TAG  = "scan-${env.MAIN_SHA_12}-${env.BUILD_NUMBER}"
+                    env.FINAL_TAG      = "git-${env.MAIN_SHA_12}"
+                    echo "Commit: ${env.SEOKPAN_GIT_SHA}"
+                    echo "RUN_ID: ${env.SEOKPAN_CI_RUN_ID}"
+                    echo "Candidate tag: ${env.CANDIDATE_TAG} / Final tag: ${env.FINAL_TAG}"
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // P1 Revalidation: docs/ci-verification.md 기준 App CI Check
+        // 6단계 전체를 main pinned commit에 재적용. app-ci-check/app-ci
+        // Agent 재사용 (buildkit-rootless에 도구 재설치 안 함).
+        // 실패 시 이후 Image 작업으로 절대 진행되지 않음(Declarative
+        // Pipeline은 상위 stage 실패 시 하위 stage를 자동 skip).
+        // --------------------------------------------------------------
+        stage('P1 Revalidation (App CI Check on main)') {
+            agent { kubernetes { inheritFrom 'app-ci-check' } }
+            environment {
+                // [반영] App Jenkinsfile v3.1과 동일. verify_ci.py 등이 HOME 기준으로
+                // 캐시/설정 경로를 잡을 수 있어 명시적으로 맞춤.
+                HOME = '/tmp'
+            }
+            stages {
+                stage('Checkout') {
+                    steps {
+                        container('app-ci') {
+                            script {
+                                // main의 최신 상태를 다시 받는 게 아니라, Branch Guard &
+                                // Prepare에서 고정한 정확히 같은 Commit을 재확인 Checkout.
+                                def scmVars = checkout scm
+                                if (scmVars.GIT_COMMIT != env.SEOKPAN_GIT_SHA) {
+                                    error("Commit mismatch on app-ci-check agent: expected ${env.SEOKPAN_GIT_SHA}, got ${scmVars.GIT_COMMIT}")
+                                }
+                                sh 'id'
+                                echo "commit=${env.SEOKPAN_GIT_SHA} run_id=${env.SEOKPAN_CI_RUN_ID}"
+                            }
+                        }
+                    }
+                }
+
+                // [수정] App Jenkinsfile v3.1 원본 그대로 반영 — 제 이전 재구성은
+                // 동작이 반대였음(기존 캐시 있으면 스킵 vs 원본은 에러로 중단,
+                // write-test 성공 시 무시 vs 원본은 명시적 실패).
+                stage('Prepare Browser Cache') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                sh '''
+                                    set -eu
+                                    SRC="/opt/playwright-cache"
+                                    DEST=".browser-cache"
+
+                                    # 새 작업 공간에 예상외 캐시가 있으면 덮어쓰거나 삭제하지 않고 중단
+                                    if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+                                        echo "ERROR: $DEST already exists in a fresh workspace. Aborting." >&2
+                                        exit 1
+                                    fi
+
+                                    START=$(date +%s)
+                                    SRC_SIZE=$(du -sh "$SRC" | cut -f1)
+                                    cp -r "$SRC" "$DEST"
+                                    END=$(date +%s)
+                                    echo "browser-cache copy: ${SRC_SIZE}, $((END-START))s, src=${SRC}"
+
+                                    REVISION_DIR="$DEST/chromium_headless_shell-1243"
+                                    [ -d "$REVISION_DIR" ] || { echo "ERROR: revision 1243 missing" >&2; exit 1; }
+                                    BIN=$(find "$REVISION_DIR" -type f -name "headless_shell" -o -name "chrome-headless-shell" | head -1)
+
+                                    [ -n "$BIN" ] && [ -x "$BIN" ] || { echo "ERROR: binary missing/not executable" >&2; exit 1; }
+                                    if ldd "$BIN" 2>&1 | grep -q "not found"; then
+                                        echo "ERROR: missing shared libraries:" >&2
+                                        ldd "$BIN" | grep "not found" >&2
+                                        exit 1
+                                    fi
+
+                                    if touch "$SRC/.write-test" 2>/dev/null; then
+                                        echo "ERROR: source is writable by CI UID - security regression" >&2
+                                        exit 1
+                                    fi
+                                    echo "source read-only confirmed"
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Backend: Install & Verify') {
+                    steps {
+                        container('app-ci') {
+                            dir('backend') {
+                                sh 'python scripts/verify_ci.py --run-id ${SEOKPAN_CI_RUN_ID} --uv /usr/local/bin/uv'
+                            }
+                        }
+                    }
+                }
+
+                stage('OpenAPI Export') {
+                    steps {
+                        container('app-ci') {
+                            dir('backend') {
+                                sh '.venv/bin/python scripts/export_openapi_ci.py --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Frontend: Install & Verify') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                // verify:ci가 Format/Lint/TypeCheck/도구시험/기능시험/Build/Audit까지
+                                // 전부 포함 (npm audit 별도 스텝 불필요, ci-verification.md 확인됨)
+                                sh 'npm run verify:ci -- --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Browser: UI') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                sh 'npm run e2e:ci -- ui --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Browser: Full') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                sh 'npm run e2e:ci -- full --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Aggregate') {
+                    steps {
+                        container('app-ci') {
+                            dir('backend') {
+                                script {
+                                    // 집계 "시도" 여부를 호출 전에 기록 - post에서 재집계하지 않음
+                                    env.P1_AGGREGATE_ATTEMPTED = 'true'
+                                    sh 'python scripts/summarize_ci.py --run-id ${SEOKPAN_CI_RUN_ID}'
+                                }
+                            }
+                            // 정상 경로는 엄격하게: 비어있으면 그 자체로 실패 (allowEmptyArchive 없음)
+                            archiveArtifacts(
+                                artifacts: "test-results/${env.SEOKPAN_CI_RUN_ID}/**",
+                                fingerprint: true
+                            )
+                            script { env.P1_PASSED = 'true' }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        try {
+                            container('app-ci') {
+                                if (env.P1_AGGREGATE_ATTEMPTED != 'true') {
+                                    dir('backend') {
+                                        sh 'python scripts/summarize_ci.py --run-id ${SEOKPAN_CI_RUN_ID} || true'
+                                    }
+                                }
+                                archiveArtifacts(
+                                    artifacts: "test-results/${env.SEOKPAN_CI_RUN_ID}/**",
+                                    allowEmptyArchive: true,
+                                    fingerprint: true
+                                )
+                            }
+                        } catch (Exception e) {
+                            echo "WARN: fallback collection skipped (agent/container unavailable): ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Harbor 작업 그룹: buildkit-rootless 하나의 Pod을 공유하며
+        // Guard -> Candidate Build(+SBOM/Provenance, digest) -> Scan -> Candidate Health ->
+        // Promote -> Verify&Cleanup -> Health Smoke -> Evidence 순서로
+        // 진행. P1이 실패하면 이 그룹 전체가 자동으로 skip됨.
+        // --------------------------------------------------------------
+        stage('Image Build & Harbor Operations') {
+            // [추가] App Jenkinsfile의 "보완사항 ④"와 동일한 이유로 명시적 가드 추가.
+            // Declarative의 자동 stage-skip만으로는 불충분하다는 게 이미 팀 리뷰로
+            // 확정된 방향이라 동일하게 적용 — 오히려 이 그룹은 Harbor에 실제 쓰기
+            // 작업을 하므로 PR Build Verify보다 더 엄격하게 가드해야 함.
+            when {
+                beforeAgent true
+                allOf {
+                    expression { env.P1_PASSED == 'true' }
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                }
+            }
+            agent { kubernetes { inheritFrom 'buildkit-rootless' } }
+            stages {
+
+                // [수정] App Jenkinsfile v3.1의 Build Verify (PR) 그룹과 동일한 패턴으로
+                // 교체. 단순 checkout scm은 "이 브랜치의 최신"을 다시 받아올 위험이
+                // 있으므로, Branch Guard & Prepare에서 고정한 정확한 Commit을 GitSCM으로
+                // 명시 지정하고 실제 체크아웃된 SHA가 일치하는지 검증한다. buildkit
+                // 컨테이너에는 git이 없을 수 있어 container() 블록 없이(자동 주입되는
+                // jnlp 컨테이너에서) 실행한다.
+                stage('Checkout (pinned main SHA)') {
+                    steps {
+                        script {
+                            checkout([
+                                $class: 'GitSCM',
+                                branches: [[name: env.SEOKPAN_GIT_SHA]],
+                                userRemoteConfigs: [[url: scm.userRemoteConfigs[0].url]]
+                            ])
+                            def actualSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                            if (actualSha != env.SEOKPAN_GIT_SHA) {
+                                error "Commit mismatch: expected ${env.SEOKPAN_GIT_SHA}, got ${actualSha}"
+                            }
+                        }
+                    }
+                }
+
+                stage('Guard: Final Tag Check') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_API_CRED,
+                                usernameVariable: 'HARBOR_API_USER',
+                                passwordVariable: 'HARBOR_API_PASS'
+                            )]) {
+                                script {
+                                    COMPONENT_REPO.each { component, repo ->
+                                        env.CURRENT_REPO = repo
+                                        def status = sh(
+                                            script: '''
+                                                python3 - <<'PYEOF'
+import os, sys, json, ssl, urllib.request, urllib.error, base64
+
+host  = os.environ["HARBOR_HOST"]
+proj  = os.environ["HARBOR_PROJECT"]
+repo  = os.environ["CURRENT_REPO"]
+tag   = os.environ["FINAL_TAG"]
+sha12 = os.environ["MAIN_SHA_12"]
+user  = os.environ["HARBOR_API_USER"]
+pw    = os.environ["HARBOR_API_PASS"]
+
+ctx = ssl.create_default_context(cafile=os.environ["HARBOR_CA_PATH"])
+url = f"https://{host}/api/v2.0/projects/{proj}/repositories/{repo}/artifacts/{tag}"
+req = urllib.request.Request(url)
+auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+req.add_header("Authorization", f"Basic {auth}")
+
+try:
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        data = json.loads(resp.read())
+        digest = data.get("digest")
+        if resp.status != 200 or not digest:
+            print("ERR", file=sys.stderr)
+            sys.exit(1)
+
+        tags = [
+            t.get("name")
+            for t in (data.get("tags") or [])
+            if isinstance(t, dict) and t.get("name")
+        ]
+
+        stale = sorted(
+            name for name in tags
+            if name.startswith(f"scan-{sha12}-")
+        )
+
+        stale_field = ",".join(stale) if stale else "-"
+        print(f"200 {digest} {stale_field}")
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception as e:
+    print("ERR", file=sys.stderr)
+    print(str(e), file=sys.stderr)
+    print("-1")
+PYEOF
+                                            ''',
+                                            returnStdout: true
+                                        ).trim()
+
+                                        echo "Guard [${component}/${repo}] result: ${status}"
+
+                                        def existing = (
+                                            status =~ /^200 (sha256:[0-9a-f]+) (.+)$/
+                                        )
+
+                                        if (existing) {
+                                            def digest = existing[0][1]
+                                            def staleField = existing[0][2]
+                                            def staleCandidates =
+                                                (staleField == '-') ?
+                                                '' :
+                                                staleField
+
+                                            echo(
+                                                "Guard [${component}]: 기존 Final " +
+                                                "${env.FINAL_TAG} 확인. " +
+                                                "재실행 복구 대상으로 재사용한다. " +
+                                                "digest=${digest}"
+                                            )
+
+                                            if (component == 'backend') {
+                                                env.FINAL_EXISTS_BACKEND = 'true'
+                                                env.FINAL_DIGEST_BACKEND = digest
+                                                env.STALE_CANDIDATES_BACKEND =
+                                                    staleCandidates
+                                            } else {
+                                                env.FINAL_EXISTS_FRONTEND = 'true'
+                                                env.FINAL_DIGEST_FRONTEND = digest
+                                                env.STALE_CANDIDATES_FRONTEND =
+                                                    staleCandidates
+                                            }
+
+                                        } else if (status == '404') {
+                                            echo "Guard [${component}]: Final 없음, 현재 Run에서 처리."
+
+                                            if (component == 'backend') {
+                                                env.FINAL_EXISTS_BACKEND = 'false'
+                                            } else {
+                                                env.FINAL_EXISTS_FRONTEND = 'false'
+                                            }
+
+                                        } else {
+                                            error(
+                                                "Guard: [${component}] 예상치 못한 응답" +
+                                                "(${status}), fail-closed 중단."
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Build & Push Candidate (+push-time digest 캡처)') {
+                    steps {
+                        withCredentials([usernamePassword(
+                            credentialsId: env.HARBOR_API_CRED,
+                            usernameVariable: 'HARBOR_API_USER',
+                            passwordVariable: 'HARBOR_API_PASS'
+                        )]) {
+                            script {
+                                COMPONENT_REPO.each { component, repo ->
+                                    def finalExists =
+                                        (component == 'backend') ?
+                                        env.FINAL_EXISTS_BACKEND :
+                                        env.FINAL_EXISTS_FRONTEND
+
+                                    if (finalExists == 'true') {
+                                        echo(
+                                            "[${component}] 기존 immutable Final 재사용 - " +
+                                            "Candidate Build/Push 생략"
+                                        )
+                                    } else {
+                                        container('buildkit') {
+                                        sh """
+                                            buildctl-daemonless.sh build \\
+                                              --frontend dockerfile.v0 \\
+                                              --local context=./${component} \\
+                                              --local dockerfile=./${component} \\
+                                              --opt attest:sbom=generator=docker.io/docker/buildkit-syft-scanner@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9 \\
+                                              --opt attest:provenance=mode=min \\
+                                              --output type=image,name=${env.HARBOR_HOST}/${env.HARBOR_PROJECT}/${repo}:${env.CANDIDATE_TAG},push=true
+                                        """
+                                    }
+                                    container('python') {
+                                        env.CURRENT_REPO = repo
+                                        def digest = sh(
+                                            script: '''
+                                                python3 - <<'PYEOF'
+import os, sys, json, ssl, urllib.request, urllib.error, base64
+
+host = os.environ["HARBOR_HOST"]; proj = os.environ["HARBOR_PROJECT"]
+repo = os.environ["CURRENT_REPO"]; cand = os.environ["CANDIDATE_TAG"]
+user = os.environ["HARBOR_API_USER"]; pw = os.environ["HARBOR_API_PASS"]
+
+ctx = ssl.create_default_context(cafile=os.environ["HARBOR_CA_PATH"])
+url = f"https://{host}/api/v2.0/projects/{proj}/repositories/{repo}/artifacts/{cand}"
+req = urllib.request.Request(url)
+auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+req.add_header("Authorization", f"Basic {auth}")
+
+try:
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        print(json.loads(resp.read())["digest"])
+except Exception as e:
+    print(f"[{repo}] Push 직후 Digest 캡처 실패: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+                                            ''',
+                                            returnStdout: true
+                                        ).trim()
+                                        // [수정, Sandbox 차단 대응] env["동적키"] = 값 형태는
+                                        // Jenkins Groovy Sandbox가 DefaultGroovyMethods.putAt을
+                                        // 승인 목록에서 막아 RejectedAccessException을 던짐
+                                        // (Tmp Job 실행에서 실제 확인됨). env는 일반 Map이 아니라
+                                        // 동적 대괄호 대입 자체가 안전 목록에 없음 — 컴포넌트가
+                                        // backend/frontend 둘뿐이므로 고정 이름 두 개로 대체.
+                                        if (component == 'backend') {
+                                            env.CAND_DIGEST_BACKEND = digest
+                                        } else if (component == 'frontend') {
+                                            env.CAND_DIGEST_FRONTEND = digest
+                                        }
+                                        echo "[${repo}] push-time digest: ${digest}"
+                                    }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Scan') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: 'harbor-robot-account',
+                                usernameVariable: 'HARBOR_ROBOT_USER',
+                                passwordVariable: 'HARBOR_ROBOT_PASS'
+                            )]) {
+                                script {
+                                    def scanSummary = [:]
+                                    COMPONENT_REPO.each { component, repo ->
+                                        def finalExists =
+                                            (component == 'backend') ?
+                                            env.FINAL_EXISTS_BACKEND :
+                                            env.FINAL_EXISTS_FRONTEND
+
+                                        if (finalExists == 'true') {
+                                            echo(
+                                                "[${component}] 기존 immutable Final 재사용 - " +
+                                                "Scan 생략"
+                                            )
+
+                                            if (component == 'backend') {
+                                                env.SCAN_BACKEND = 'SKIPPED_EXISTING_FINAL'
+                                            } else {
+                                                env.SCAN_FRONTEND = 'SKIPPED_EXISTING_FINAL'
+                                            }
+                                        } else {
+                                            env.CURRENT_REPO = repo
+                                        def output = sh(
+                                            script: '''
+                                                set -eu
+                                                export SSL_CERT_FILE="${HARBOR_CA_PATH}"
+                                                IMAGE_REF="${HARBOR_HOST}/${HARBOR_PROJECT}/${CURRENT_REPO}:${CANDIDATE_TAG}"
+                                                REPORT_FILE="/tmp/trivy-${CURRENT_REPO}.json"
+
+                                                trivy image \\
+                                                  --scanners vuln \\
+                                                  --format json --severity CRITICAL,HIGH --exit-code 0 \\
+                                                  --username "${HARBOR_ROBOT_USER}" --password "${HARBOR_ROBOT_PASS}" \\
+                                                  --output "${REPORT_FILE}" "${IMAGE_REF}"
+
+                                                python3 - "${REPORT_FILE}" "${CURRENT_REPO}" <<'PYEOF'
+import sys, json
+report_file, repo = sys.argv[1], sys.argv[2]
+with open(report_file) as f:
+    data = json.load(f)
+vulns = []
+for result in (data.get("Results") or []):
+    vulns.extend(result.get("Vulnerabilities") or [])
+critical = [v for v in vulns if str(v.get("Severity","")).upper() == "CRITICAL"]
+high_fixable = [v for v in vulns if str(v.get("Severity","")).upper() == "HIGH" and v.get("FixedVersion")]
+print(f"[{repo}] CRITICAL={len(critical)}, HIGH(fix 있음)={len(high_fixable)}, 전체={len(vulns)}")
+print(f"SCAN_SUMMARY={repo}=critical:{len(critical)},high_fixable:{len(high_fixable)}")
+if critical or high_fixable:
+    for v in (critical + high_fixable):
+        print(f"  - {v.get('VulnerabilityID')} severity={v.get('Severity')} pkg={v.get('PkgName')} fixed={v.get('FixedVersion')}")
+    print(f"[{repo}] Scan 차단 정책 위반 - Promote 진행 불가")
+    sys.exit(1)
+print(f"[{repo}] Scan 통과")
+PYEOF
+                                            ''',
+                                            returnStdout: true
+                                        ).trim()
+                                        echo output
+                                        def m = (output =~ /SCAN_SUMMARY=${repo}=critical:(\d+),high_fixable:(\d+)/)
+                                        def summary = m ? "critical:${m[0][1]},high_fixable:${m[0][2]}" : 'UNKNOWN'
+                                        scanSummary[repo] = summary
+
+                                        if (component == 'backend') {
+                                            env.SCAN_BACKEND = summary
+                                        } else if (component == 'frontend') {
+                                            env.SCAN_FRONTEND = summary
+                                        }
+                                        }
+                                    }
+                                    env.SCAN_SUMMARY = scanSummary.collect { k, v -> "${k}(${v})" }.join(', ')
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --------------------------------------------------------------
+                // Candidate Health Process Smoke:
+                // Scan을 통과한 Candidate Image를 Final Promote 전에 검증한다.
+                // Smoke 실패 시 immutable git-* Final Tag는 생성되지 않는다.
+                // --------------------------------------------------------------
+                stage('Candidate Health Smoke Test') {
+                    steps {
+                        script {
+                            HEALTH_CFG.each { component, cfg ->
+                                def finalExists =
+                                    (component == 'backend') ?
+                                    env.FINAL_EXISTS_BACKEND :
+                                    env.FINAL_EXISTS_FRONTEND
+
+                                if (finalExists == 'true') {
+                                    echo(
+                                        "[${component}] 기존 immutable Final 재사용 - " +
+                                        "Candidate Health Smoke 생략"
+                                    )
+
+                                    if (component == 'backend') {
+                                        env.HEALTH_BACKEND = 'SKIPPED_EXISTING_FINAL'
+                                    } else {
+                                        env.HEALTH_FRONTEND = 'SKIPPED_EXISTING_FINAL'
+                                    }
+                                } else {
+                                    def repo = COMPONENT_REPO[component]
+                                def label = "smoke-${component}-${env.BUILD_NUMBER}"
+                                def targetImage = "${env.HARBOR_HOST}/${env.HARBOR_PROJECT}/${repo}:${env.CANDIDATE_TAG}"
+                                def checkerImage = "${env.HARBOR_HOST}/${env.HARBOR_PROJECT}/ci-python@sha256:19349910928096e034c1e45b51f3b446e95e152b2525695afe8fc791914b49a5"
+
+                                // [현행화, apps/backend·frontend/deployment.yaml 대조]
+                                // Image Smoke의 securityContext는 현재 운영 Deployment의 핵심 제약을 따른다.
+                                // Backend: runAsNonRoot/runAsGroup/allowPrivilegeEscalation:false/
+                                //   capabilities drop ALL까지 정확히 일치.
+                                // Frontend: 현재 GitOps Deployment는 replicas:2 및
+                                //   readOnlyRootFilesystem:true를 명시한다. Smoke도 read-only를 유지하되,
+                                //   이 주석은 Deployment의 모든 보안 필드를 완전히 복제한다는 뜻이 아니다.
+                                //   GitOps securityContext가 바뀌면 다시 대조한다.
+                                def extraSecCtx = component == 'backend' ? '''
+                                              runAsNonRoot: true
+                                              runAsGroup: ''' + cfg.uid + '''
+                                              allowPrivilegeEscalation: false
+                                              capabilities:
+                                                drop: ["ALL"]''' : '''
+                                              runAsNonRoot: true
+                                              allowPrivilegeEscalation: false
+                                              capabilities:
+                                                drop: ["ALL"]'''
+
+                                // [반영, apps/backend/configmap.yaml + settings.py 대조 완료]
+                                // backend-config의 실제 키를 반영하되, SEOKPAN_ENVIRONMENT만
+                                // ConfigMap의 "production"이 아니라 "test"로 지정 — settings.py의
+                                // Literal["local","test","development","production"]에 "test"가
+                                // 실제로 정의돼 있음을 코드로 확인함(추론이 아니라 확정).
+                                //
+                                // [해결됨, 실행으로 확인] SEOKPAN_ALLOWED_ORIGINS는
+                                // settings.py에서 allowed_origins: tuple[str, ...] 타입임 —
+                                // pydantic-settings는 tuple/list 같은 복합 타입을 env var에서
+                                // JSON으로 파싱하므로 순수 문자열("https://...")을 넣으면
+                                // SettingsError로 죽음(실제 Health Smoke 실행에서 확인됨).
+                                // JSON 배열 형식('["https://..."]')으로 수정 완료.
+                                //
+                                // [확인됨, 리스크 아니었음] identity_database_url/
+                                // game_database_url/database_ca_file/redis_url은 전부
+                                // settings.py에서 `str | None = None`(Optional)임 — 이전에
+                                // 우려했던 "DB URL/CA 파일 없으면 부팅 실패" 리스크는 애초에
+                                // 없었음. 더미 값은 넣어도 무해하지만 없어도 무방.
+                                def extraEnv = component == 'backend' ? '''
+                                            env:
+                                            - name: SEOKPAN_ENVIRONMENT
+                                              value: "test"
+                                            - name: SEOKPAN_LOG_LEVEL
+                                              value: "INFO"
+                                            - name: SEOKPAN_ALLOWED_ORIGINS
+                                              value: '["https://game.seokpan.soldesk.store"]'
+''' : ''
+
+                                podTemplate(
+                                    label: label,
+                                    namespace: 'cicd',
+                                    // [수정, Sandbox/타입 불일치 대응] Scripted podTemplate()의
+                                    // imagePullSecrets 파라미터는 List<String>(이름만)을 받음.
+                                    imagePullSecrets: ['harbor-pull-secret'],
+                                    yaml: """
+                                        apiVersion: v1
+                                        kind: Pod
+                                        spec:
+                                          securityContext:
+                                            seccompProfile:
+                                              type: RuntimeDefault
+                                          containers:
+                                          - name: target
+                                            image: "${targetImage}"
+                                            securityContext:
+                                              runAsUser: ${cfg.uid}
+                                              readOnlyRootFilesystem: true
+${extraSecCtx}
+${extraEnv}
+                                            volumeMounts:
+                                            - name: tmp
+                                              mountPath: /tmp
+                                            # [확인됨, backend/Dockerfile 대조] 별도 쓰기 경로 요구사항 없음.
+                                            # UV_COMPILE_BYTECODE=1로 바이트코드는 빌드 타임에 이미 컴파일되고
+                                            # /health/live는 순수 조회라 런타임 쓰기가 필요 없음. /tmp만
+                                            # 안전망으로 마운트.
+                                          - name: checker
+                                            image: "${checkerImage}"
+                                            command: ["cat"]
+                                            tty: true
+                                          volumes:
+                                          - name: tmp
+                                            emptyDir: {}
+                                    """
+                                ) {
+                                    node(label) {
+                                        container('checker') {
+                                            sh """
+                                                python3 - <<'PYEOF'
+import sys
+import time
+import urllib.request
+
+url = "http://localhost:${cfg.port}${cfg.path}"
+deadline = time.time() + 30
+last_error = None
+
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status == 200:
+                print("[${component}] HEALTH=PASS HTTP=200 URL=" + url)
+                sys.exit(0)
+            last_error = RuntimeError(f"HTTP {resp.status}")
+    except Exception as exc:
+        last_error = exc
+
+    time.sleep(2)
+
+print(
+    f"[${component}] HEALTH=FAIL URL={url} last_error={last_error}",
+    file=sys.stderr,
+)
+sys.exit(1)
+PYEOF
+                                            """
+                                        }
+                                        // [제거됨, 실행으로 재확인] target 컨테이너 내부 Jenkins sh 실행을
+                                        // 두 번(fsGroup 미적용/적용) 시도했지만 둘 다 동일하게
+                                        // "process apparently never started"로 5분 대기 후 실패함
+                                        // (checker는 두 번 다 문제없이 성공). PID 1이 uvicorn(idle
+                                        // 대기용 "cat"이 아닌 실제 애플리케이션)이고
+                                        // readOnlyRootFilesystem:true인 컨테이너에 Jenkins Kubernetes
+                                        // Plugin의 Durable Task(sh 스텝)를 실행하는 조합 자체가
+                                        // 이 환경에서 안정적으로 동작하지 않는 것으로 판단 — emptyDir
+                                        // 소유권 문제가 아니었음(fsGroup 적용 후에도 재현).
+                                        // 대신 필요했던 검증은 이미 다른 방식으로 충분히 증명됨:
+                                        //   - UID 강제: K8s가 Pod 시작 시점에 runAsUser로 강제하는
+                                        //     것이라 별도 `id` 확인 불필요 — 강제가 안 됐다면 애초에
+                                        //     Pod이 뜨지 않거나 아래 health check가 실패했을 것.
+                                        //   - 부팅 성공: /health/live가 HTTP 200을 반환했다는 것
+                                        //     자체가 declared securityContext 그대로 프로세스가
+                                        //     정상 기동해 소켓까지 열었다는 증거.
+                                        // Migration 자산 존재 확인은 exec 없이 검증하는
+                                        // 방법(예: registry API로 이미지 레이어 직접 조회)을
+                                        // 팀에서 별도로 설계해야 함 — 이번 스모크 범위에서는 제외.
+
+                    }
+                }
+                                if (component == 'backend') {
+                                    env.HEALTH_BACKEND = 'PASS_PROCESS_SMOKE'
+                                } else if (component == 'frontend') {
+                                    env.HEALTH_FRONTEND = 'PASS_PROCESS_SMOKE'
+                                }
+
+                                echo "[${component}] Candidate Health Process Smoke PASS"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Promote') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_API_CRED,
+                                usernameVariable: 'HARBOR_API_USER',
+                                passwordVariable: 'HARBOR_API_PASS'
+                            )]) {
+                                script {
+                                    COMPONENT_REPO.each { component, repo ->
+                                        def finalExists =
+                                            (component == 'backend') ?
+                                            env.FINAL_EXISTS_BACKEND :
+                                            env.FINAL_EXISTS_FRONTEND
+
+                                        if (finalExists == 'true') {
+                                            echo(
+                                                "[${component}] 기존 immutable Final 재사용 - " +
+                                                "Promote 생략"
+                                            )
+                                        } else {
+                                            env.CURRENT_REPO = repo
+                                        sh '''
+                                            python3 - <<'PYEOF'
+import os, json, ssl, urllib.request, urllib.error, base64
+host = os.environ["HARBOR_HOST"]; proj = os.environ["HARBOR_PROJECT"]
+repo = os.environ["CURRENT_REPO"]; cand = os.environ["CANDIDATE_TAG"]; final = os.environ["FINAL_TAG"]
+user = os.environ["HARBOR_API_USER"]; pw = os.environ["HARBOR_API_PASS"]
+ctx = ssl.create_default_context(cafile=os.environ["HARBOR_CA_PATH"])
+url = f"https://{host}/api/v2.0/projects/{proj}/repositories/{repo}/artifacts/{cand}/tags"
+body = json.dumps({"name": final}).encode()
+req = urllib.request.Request(url, data=body, method="POST")
+auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+req.add_header("Authorization", f"Basic {auth}"); req.add_header("Content-Type", "application/json")
+try:
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        print(f"Promote OK [{repo}]: {resp.status}")
+except urllib.error.HTTPError as e:
+    print(f"Promote FAILED [{repo}]: {e.code} {e.read().decode()}")
+    raise SystemExit(1)
+PYEOF
+                                        '''
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Verify Digest & Cleanup Candidate') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_API_CRED,
+                                usernameVariable: 'HARBOR_API_USER',
+                                passwordVariable: 'HARBOR_API_PASS'
+                            )]) {
+                                script {
+                                    def cleanupResults = [:]
+                                    COMPONENT_REPO.each { component, repo ->
+                                        def finalExists =
+                                            (component == 'backend') ?
+                                            env.FINAL_EXISTS_BACKEND :
+                                            env.FINAL_EXISTS_FRONTEND
+
+                                        if (finalExists == 'true') {
+                                            def staleCandidates =
+                                                (component == 'backend') ?
+                                                (env.STALE_CANDIDATES_BACKEND ?: '') :
+                                                (env.STALE_CANDIDATES_FRONTEND ?: '')
+
+                                            if (staleCandidates) {
+                                                env.CURRENT_REPO = repo
+                                                env.CURRENT_STALE_CANDIDATES =
+                                                    staleCandidates
+
+                                                sh """
+                                                    python3 - <<'PYEOF'
+import os
+import ssl
+import urllib.request
+import base64
+import sys
+
+host = os.environ["HARBOR_HOST"]
+proj = os.environ["HARBOR_PROJECT"]
+repo = os.environ["CURRENT_REPO"]
+final = os.environ["FINAL_TAG"]
+user = os.environ["HARBOR_API_USER"]
+pw = os.environ["HARBOR_API_PASS"]
+
+tags = [
+    x for x in
+    os.environ["CURRENT_STALE_CANDIDATES"].split(",")
+    if x
+]
+
+ctx = ssl.create_default_context(
+    cafile=os.environ["HARBOR_CA_PATH"]
+)
+
+auth = base64.b64encode(
+    f"{user}:{pw}".encode()
+).decode()
+
+for cand in tags:
+    url = (
+        f"https://{host}/api/v2.0/projects/{proj}/"
+        f"repositories/{repo}/artifacts/{final}/tags/{cand}"
+    )
+
+    req = urllib.request.Request(
+        url,
+        method="DELETE",
+    )
+    req.add_header(
+        "Authorization",
+        f"Basic {auth}",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=15,
+            context=ctx,
+        ) as resp:
+            print(
+                f"[{repo}] stale Candidate 삭제 완료: "
+                f"{cand} status={resp.status}"
+            )
+    except Exception as e:
+        print(
+            f"[{repo}] stale Candidate 삭제 실패: "
+            f"{cand}: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+PYEOF
+                                                """
+
+                                                cleanupResults[repo] =
+                                                    'OK_REUSED_FINAL'
+
+                                                if (component == 'backend') {
+                                                    env.CLEANUP_BACKEND =
+                                                        'OK_REUSED_FINAL'
+                                                } else {
+                                                    env.CLEANUP_FRONTEND =
+                                                        'OK_REUSED_FINAL'
+                                                }
+
+                                            } else {
+                                                cleanupResults[repo] =
+                                                    'NO_STALE_CANDIDATE'
+
+                                                if (component == 'backend') {
+                                                    env.CLEANUP_BACKEND =
+                                                        'NO_STALE_CANDIDATE'
+                                                } else {
+                                                    env.CLEANUP_FRONTEND =
+                                                        'NO_STALE_CANDIDATE'
+                                                }
+                                            }
+
+                                            echo(
+                                                "[${component}] 기존 immutable Final 재사용 - " +
+                                                "Final Digest=${(component == 'backend') ? env.FINAL_DIGEST_BACKEND : env.FINAL_DIGEST_FRONTEND}, " +
+                                                "cleanup=${cleanupResults[repo]}"
+                                            )
+                                        } else {
+                                            env.CURRENT_REPO = repo
+                                            env.CURRENT_CAND_DIGEST =
+                                                (component == 'backend') ?
+                                                env.CAND_DIGEST_BACKEND :
+                                                env.CAND_DIGEST_FRONTEND
+                                        def output = sh(
+                                            script: '''
+                                                python3 - <<'PYEOF'
+import os, json, ssl, urllib.request, urllib.error, base64
+host = os.environ["HARBOR_HOST"]; proj = os.environ["HARBOR_PROJECT"]
+repo = os.environ["CURRENT_REPO"]; cand = os.environ["CANDIDATE_TAG"]; final = os.environ["FINAL_TAG"]
+push_digest = os.environ["CURRENT_CAND_DIGEST"]
+user = os.environ["HARBOR_API_USER"]; pw = os.environ["HARBOR_API_PASS"]; cafile = os.environ["HARBOR_CA_PATH"]
+ctx = ssl.create_default_context(cafile=cafile)
+auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+def get_digest(tag):
+    url = f"https://{host}/api/v2.0/projects/{proj}/repositories/{repo}/artifacts/{tag}"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Basic {auth}")
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        return json.loads(resp.read())["digest"]
+
+try:
+    final_digest = get_digest(final)
+except Exception as e:
+    print(f"[{repo}] Final Digest 조회 실패: {e}")
+    raise SystemExit(1)
+
+if final_digest != push_digest:
+    print(f"[{repo}] DIGEST MISMATCH: push-time={push_digest} final={final_digest}")
+    raise SystemExit(1)
+print(f"[{repo}] Digest 일치 확인 (push-time 기준): {final_digest}")
+print(f"FINAL_DIGEST={repo}={final_digest}")
+
+del_url = f"https://{host}/api/v2.0/projects/{proj}/repositories/{repo}/artifacts/{final}/tags/{cand}"
+req = urllib.request.Request(del_url, method="DELETE")
+req.add_header("Authorization", f"Basic {auth}")
+try:
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        print(f"[{repo}] Candidate 태그 삭제 완료: {resp.status}")
+        print(f"CLEANUP_STATUS={repo}=OK")
+except Exception as e:
+    print(f"[{repo}] Candidate 태그 삭제 실패: {e}", file=sys.stderr)
+    print(f"CLEANUP_STATUS={repo}=FAILED", file=sys.stderr)
+    raise SystemExit(1)
+PYEOF
+                                            ''',
+                                            returnStdout: true
+                                        ).trim()
+                                        echo output
+
+                                        def dm = (output =~ /FINAL_DIGEST=${repo}=(sha256:[0-9a-f]+)/)
+                                        if (!dm) {
+                                            error("[${repo}] Final Digest Evidence 추출 실패")
+                                        }
+                                        def finalDigest = dm[0][1]
+
+                                        def cm = (output =~ /CLEANUP_STATUS=${repo}=(OK|FAILED)/)
+                                        def cleanupStatus = cm ? cm[0][1] : 'UNKNOWN'
+
+                                        cleanupResults[repo] = cleanupStatus
+
+                                        if (component == 'backend') {
+                                            env.FINAL_DIGEST_BACKEND = finalDigest
+                                            env.CLEANUP_BACKEND = cleanupStatus
+                                        } else if (component == 'frontend') {
+                                            env.FINAL_DIGEST_FRONTEND = finalDigest
+                                            env.CLEANUP_FRONTEND = cleanupStatus
+                                        }
+                                        }
+                                    }
+                                    env.CLEANUP_SUMMARY = cleanupResults.collect { k, v -> "${k}=${v}" }.join(', ')
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --------------------------------------------------------------
+                // Evidence 기록: Commit/Build/Tag/Digest/Scan 결과를 구조화된
+                // JSON으로 Build Artifact에 남긴다 (팀 결정 ④). 이 파일이 곧
+                // GitOps 작업으로 넘기는 인계 자료다 (팀 결정 ⑤, #40 경계).
+                // --------------------------------------------------------------
+                stage('Record Commit-Build-Tag-Digest Evidence') {
+                    steps {
+                        container('python') {
+                            script {
+                                def backendReused =
+                                    env.FINAL_EXISTS_BACKEND == 'true'
+                                def frontendReused =
+                                    env.FINAL_EXISTS_FRONTEND == 'true'
+
+                                def backendCandidateTag =
+                                    backendReused ? '' : env.CANDIDATE_TAG
+                                def frontendCandidateTag =
+                                    frontendReused ? '' : env.CANDIDATE_TAG
+
+                                def backendCandidateDigest =
+                                    env.CAND_DIGEST_BACKEND ?: ''
+                                def frontendCandidateDigest =
+                                    env.CAND_DIGEST_FRONTEND ?: ''
+
+                                def backendFinalDigest  = env.FINAL_DIGEST_BACKEND ?: ''
+                                def frontendFinalDigest = env.FINAL_DIGEST_FRONTEND ?: ''
+
+                                def backendScan  = env.SCAN_BACKEND ?: 'UNKNOWN'
+                                def frontendScan = env.SCAN_FRONTEND ?: 'UNKNOWN'
+
+                                def backendHealth  = env.HEALTH_BACKEND ?: 'UNKNOWN'
+                                def frontendHealth = env.HEALTH_FRONTEND ?: 'UNKNOWN'
+
+                                def backendCleanup  = env.CLEANUP_BACKEND ?: 'UNKNOWN'
+                                def frontendCleanup = env.CLEANUP_FRONTEND ?: 'UNKNOWN'
+
+                                def metadataJson = """{
+  "commit_sha_full": "${env.SEOKPAN_GIT_SHA}",
+  "commit_sha_12": "${env.MAIN_SHA_12}",
+  "jenkins_build_url": "${env.BUILD_URL}",
+  "jenkins_build_number": "${env.BUILD_NUMBER}",
+  "run_id": "${env.SEOKPAN_CI_RUN_ID}",
+  "components": {
+    "backend": {
+      "harbor_repo": "backend",
+      "candidate_tag": "${backendCandidateTag}",
+      "candidate_digest": "${backendCandidateDigest}",
+      "reused_existing_final": ${backendReused},
+      "final_tag": "${env.FINAL_TAG}",
+      "final_digest": "${backendFinalDigest}",
+      "scan": "${backendScan}",
+      "health_smoke": "${backendHealth}",
+      "cleanup_status": "${backendCleanup}"
+    },
+    "frontend": {
+      "harbor_repo": "frontend",
+      "candidate_tag": "${frontendCandidateTag}",
+      "candidate_digest": "${frontendCandidateDigest}",
+      "reused_existing_final": ${frontendReused},
+      "final_tag": "${env.FINAL_TAG}",
+      "final_digest": "${frontendFinalDigest}",
+      "scan": "${frontendScan}",
+      "health_smoke": "${frontendHealth}",
+      "cleanup_status": "${frontendCleanup}"
+    }
+  },
+  "gitops_change": "DELEGATED_TO_PROMOTION_STAGE",
+  "note": "검증된 Image/Digest는 후속 GitOps Promotion PR Stage가 처리한다."
+}
+"""
+                                writeFile file: 'image-metadata.json', text: metadataJson
+                                archiveArtifacts artifacts: 'image-metadata.json', fingerprint: true
+                                echo "Evidence 기록 완료: image-metadata.json"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // GitOps Promotion (#98):
+        // 검증된 Final image가 모두 확정된 뒤, Harbor credential이 마운트되지
+        // 않는 app-ci-check Agent에서 GitHub promotion credential만 명시적으로
+        // 바인딩해 GitOps branch/commit/push/PR 생성까지 수행한다.
+        // main 직접 push / auto-merge / Cluster 직접 변경은 하지 않는다.
+        // --------------------------------------------------------------
+        stage('Create GitOps Promotion PR') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { env.P1_PASSED == 'true' }
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                    expression {
+                        env.FINAL_DIGEST_BACKEND &&
+                        env.FINAL_DIGEST_FRONTEND
+                    }
+                }
+            }
+            agent { kubernetes { inheritFrom 'app-ci-check' } }
+            steps {
+                container('app-ci') {
+                    script {
+                        // Branch Guard에서 고정한 App main Commit을 새 Agent에서도
+                        // 정확히 다시 Checkout한다. 최신 main을 임의로 따라가지 않는다.
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: env.SEOKPAN_GIT_SHA]],
+                            userRemoteConfigs: [[url: scm.userRemoteConfigs[0].url]]
+                        ])
+
+                        def actualSha = sh(
+                            script: 'git rev-parse HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                        if (actualSha != env.SEOKPAN_GIT_SHA) {
+                            error(
+                                "Promotion source mismatch: expected " +
+                                "${env.SEOKPAN_GIT_SHA}, got ${actualSha}"
+                            )
+                        }
+                    }
+
+                    sh '''
+                        set -eu
+                        python3 --version
+                        git --version
+                        python3 scripts/test_promote_gitops.py
+                    '''
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'gitops-promotion-github',
+                        usernameVariable: 'GITOPS_GITHUB_USER',
+                        passwordVariable: 'GITOPS_GITHUB_TOKEN'
+                    )]) {
+                        sh '''
+                            set -eu
+                            python3 scripts/promote_gitops.py \
+                              --result-file gitops-promotion-result.json
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'gitops-promotion-result.json',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Image Pipeline 실패: ${env.CANDIDATE_TAG ?: 'N/A'} / ${env.FINAL_TAG ?: 'N/A'} (scan-* Candidate는 삭제하지 않고 보존, Retention 정책으로 추후 정리 예정)"
+        }
+        success {
+            echo "Image Pipeline 성공: ${env.FINAL_TAG} Final 상태 정상. Candidate 정리 결과: ${env.CLEANUP_SUMMARY ?: '기록 없음'}. Scan 요약: ${env.SCAN_SUMMARY ?: '기록 없음'}"
+        }
+    }
+}

@@ -1,0 +1,27 @@
+# 2차 App 이관 기준과 출처
+
+- 원본: `seokpan/seokpan-app`
+- 고정 Seed: `7fce757f963ba59cc81c03028c043be5b45719b2`
+- 선택일: 2026-10-02 KST
+- 대상: `seokpan/seokpan-hybrid-app`
+- 보존할 대상 main: `cef46c4e7b0cbd0cf6ebab487ee92c32d800ccdc`
+
+1차의 공식 종료일은 2026-09-23이며 이 Seed는 이후 Maintenance가 반영된 Source다. 기존 App 전체 이력과 2차 초기 main 이력을 모두 부모로 보존한다. 원본 1차 저장소에는 변경·Push하지 않는다. Snapshot만 복사하거나 기존 2차 main을 강제로 교체하지 않는다. 이관 브랜치에 대해 별도 PR·사람 리뷰·병합을 수행한다.
+
+선택 시 원본 main이 위 SHA임을 GitHub API와 Git Clone에서 대조했다. 동일 SHA의 `continuous-integration/jenkins/branch`가 Image Pipeline main #39를 가리키는 `success`였고, 별도 GitHub Check Run은 0건이었다. 성공 상태와 Image/Scan의 전체 원문, 실제 서비스 검증은 서로 다른 근거다. 이번 이관 변경은 원본 Image를 그대로 새 검증 Image로 쓰지 않으며 수정 Source의 새 Build·Scan·Digest·lab 시험이 필요하다.
+
+원본의 `pcre2` Image Scan 패치 #143과 직전 Maintenance를 포함한다. 공개 Source 범위에서 Seed보다 최신 main 변경은 선택 시 확인되지 않았다. 개인 PC·Controller의 미커밋 수정 여부는 미확인이므로 해당 작업자가 이관/Build 전에 대조한다. 선택 이후 변경은 자동 동기화하지 않고 영향 검토와 Cherry-pick/Backport 여부를 기록한다.
+
+초기 2차 main의 `.gitignore` 보호 패턴은 1차 App 패턴과 함께 보존한다. Seed 대비 수정 범위와 초기 2차 main 대비 전체 Source 이관 범위는 별도로 검사·기록한다. 원본 Seed의 Issue/PR Template과 기본 Jenkinsfile에 있던 공백 9건은 이관 변경이 아니므로 그대로 보존하며, 새 변경의 공백 검사는 고정 Seed 대비 수행한다.
+
+`README.phase1.md`는 Seed의 README 원문이며 과거 기술·실행·CI 설명을 보존한다. 2차 Runtime 상태나 성공 근거로 읽지 않는다. 루트 README는 2차 저장소의 역할·현재 변경 범위로 구분한다.
+
+1차 Image Pipeline은 기존 Harbor 프로젝트와 `seokpan-gitops`를 대상으로 한다. 이관본의 루트 Image Pipeline 진입점은 CI #2 전환이 완료될 때까지 즉시 중단한다. 원본은 `reference/phase1-ci/Jenkinsfile.image-pipeline`에 그대로 보존하며 실행 Job으로 등록하지 않는다. 1차 Pipeline·Job·공유 Template은 변경하지 않았다.
+
+이관 이후 Source 수정은 App #1의 환경별 대상 검사와 Redis TLS·별도 AUTH 계약, 별도 App #4 TH-14 검토로 재현한 Turn/Departure 종료 경쟁 보완이다. 연결 구현 당시 검사는 [연결 계약](backend/docs/hybrid-connections.md), 뒤의 공유 최종화 예약·DB 보호·재시도와 제한된 회귀는 [Turn/Departure 최종화](backend/docs/turn-departure-finalization.md)에서 구분한다. Dependency/Lock·게임 Lifecycle 모드 선택·DB Schema·실제 Redis Runtime 배치·Cloud 생성/삭제·목표 RTO/RPO를 변경하지 않는다. Source 검사는 실제 다중 Pod 업무 시험과 Image·배포·복구 수락을 대신하지 않는다.
+
+## 2026-10-03 원격 게시와 이력 보존
+
+사용자가 전체 Bundle을 작업 브랜치로 전송했고, 원격 `c837120c25c34b88bf6c6ee8e122ff50cbff062d`의 Tree·390개 파일과 전체 78개 Commit 이력을 확인했습니다. 초기 이관 Commit `c7a452d514742f77abd2c49c5836566df7386550`의 두 부모는 위 2차 초기 main과 고정 1차 Seed입니다.
+
+main의 보호 규칙은 승인 1명과 Squash 병합을 요구합니다. 원본 이력은 같은 저장소의 [reference/app-migration-history-20261002](https://github.com/seokpan/seokpan-hybrid-app/tree/reference/app-migration-history-20261002)를 위 c837 Commit에 고정해 보존합니다. 이 reference를 이동하거나 일괄 Branch 정리에서 삭제하지 않습니다. 일반 작업 브랜치는 리뷰·병합 후 정리할 수 있지만, main의 Squash Commit과 reference의 원본 계보는 구분합니다. 이 정책 연결은 App 코드·Schema·Dependency·검사 결과나 실제 Image/복구 상태를 변경하지 않습니다.

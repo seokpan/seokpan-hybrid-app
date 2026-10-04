@@ -1,0 +1,11 @@
+# 작성자: 최유준 / 작성 날짜: 2026-09-04
+node_modules/
+dist/
+.git/
+.gitignore
+README.md
+src/**/*.test.tsx
+coverage/
+.browser-cache/
+test-results/
+playwright-report/

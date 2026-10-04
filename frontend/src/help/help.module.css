@@ -1,0 +1,83 @@
+.dialog {
+  width: min(940px, calc(100% - 2rem));
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  color: #112343;
+}
+.dialog::backdrop {
+  background: #081637a6;
+}
+.dialog p {
+  font-size: 0.95rem;
+  line-height: 1.75;
+}
+.dialog section {
+  border-top: 1px solid #e0e5ee;
+  margin-top: 1.4rem;
+  padding-top: 0.5rem;
+}
+.dialog h3 {
+  font-size: 1.1rem;
+}
+.dialog button {
+  color: #123c78;
+  background: white;
+}
+.dialog button:last-child {
+  color: white;
+  background: #123c78;
+}
+.steps {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.7rem;
+  margin-block: 1.5rem;
+}
+.steps li {
+  border: 1px solid #dce3ed;
+  border-radius: 0.65rem;
+  background: #f7f9fc;
+  padding: 0.8rem;
+  min-width: 0;
+}
+.steps span {
+  display: inline-grid;
+  place-items: center;
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 50%;
+  color: white;
+  background: #123c78;
+}
+.steps h3 {
+  font-size: 0.95rem;
+  margin: 0.7rem 0;
+}
+.steps p {
+  font-size: 0.85rem;
+  margin: 0;
+}
+.rules summary {
+  color: #123c78;
+  cursor: pointer;
+  padding-block: 0.5rem;
+}
+@media (max-width: 700px) {
+  .steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .steps li {
+    display: grid;
+    grid-template-columns: 1.7rem minmax(0, 1fr);
+    gap: 0.3rem 0.6rem;
+  }
+  .steps h3 {
+    margin: 0.2rem 0;
+  }
+  .steps p {
+    grid-column: 2;
+  }
+}

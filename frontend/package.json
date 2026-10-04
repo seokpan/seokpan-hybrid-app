@@ -1,0 +1,59 @@
+{
+  "name": "seokpan-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "npm@12.0.2",
+  "scripts": {
+    "dev": "vite",
+    "api:generate": "node scripts/generate-api.mjs",
+    "api:check": "node scripts/generate-api.mjs --check",
+    "verify": "node scripts/verify.mjs",
+    "verify:ci": "node scripts/frontend-ci.mjs",
+    "format:check": "prettier --check src e2e scripts *.ts *.mjs *.json index.html",
+    "format": "prettier --write src e2e scripts *.ts *.mjs *.json index.html",
+    "lint": "eslint src e2e scripts *.ts *.mjs --max-warnings=0",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:ci": "node scripts/unit-ci.mjs",
+    "test:tooling": "node --test scripts/*.test.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "e2e:install": "node scripts/browser-e2e.mjs install",
+    "e2e:ci": "node scripts/browser-ci.mjs",
+    "e2e": "node scripts/browser-e2e.mjs test"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-router-dom": "7.18.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.63.0",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.1",
+    "@vitest/coverage-v8": "4.1.11",
+    "eslint": "10.10.0",
+    "globals": "17.12.0",
+    "jsdom": "30.0.1",
+    "openapi-typescript": "7.13.0",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.0",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "@redocly/openapi-core@1.34.19": {
+      "js-yaml": "4.3.2"
+    }
+  },
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=12 <13"
+  }
+}

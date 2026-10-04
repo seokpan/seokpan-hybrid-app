@@ -1,0 +1,1 @@
+"""Seokpan backend application package."""
