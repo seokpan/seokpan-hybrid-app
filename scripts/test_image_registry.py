@@ -62,6 +62,7 @@ class MockState:
         self.manifests: dict[tuple[str, str], tuple[bytes, str]] = {}
         self.immutable_repos = {"seokpan-fnd-backend", "seokpan-fnd-frontend"}
         self.lie_about_digest = False
+        self.missing_repo_code = "NAME_UNKNOWN"
         self.requests: list[tuple[str, str]] = []
         self.auth_seen: set[str] = set()
 
@@ -99,7 +100,7 @@ def make_handler(state: MockState) -> type[BaseHTTPRequestHandler]:
                 return self._send(404)
             repo, ref = match["repo"], match["ref"]
             if repo not in state.repos:
-                return self._errors(404, "NAME_UNKNOWN")
+                return self._errors(404, state.missing_repo_code)
             found = state.manifests.get((repo, ref))
             if found is None:
                 return self._errors(404, "MANIFEST_UNKNOWN")
@@ -228,6 +229,24 @@ class DescribeTests(RegistryTestCase):
         )
         self.assertEqual(code, target.EXIT_ERROR)
         self.assertIn("Digest 불일치", stderr)
+
+    def test_harbor_repository_not_created_yet_counts_as_missing_tag(self) -> None:
+        # 새 Harbor Project의 첫 Run: Repository가 아직 없다 (Harbor는 NOT_FOUND를 쓴다)
+        for code in ("NOT_FOUND", "NAME_UNKNOWN"):
+            self.state.repos.discard("hybrid/backend")
+            self.state.missing_repo_code = code
+            result = self.cli(
+                "describe", "--registry", "harbor", "--component", "backend", "--tag", "git-x"
+            )
+            self.assertEqual(result[0], target.EXIT_NOT_FOUND, code)
+
+    def test_ecr_repository_not_found_code_stays_an_error(self) -> None:
+        self.state.repos.discard("seokpan-fnd-backend")
+        self.state.missing_repo_code = "NOT_FOUND"
+        code, _, _ = self.cli(
+            "describe", "--registry", "ecr", "--component", "backend", "--tag", "git-x"
+        )
+        self.assertEqual(code, target.EXIT_ERROR)
 
     def test_basic_auth_is_sent_with_aws_user_for_ecr(self) -> None:
         self.put("seokpan-fnd-backend", "scan-x", make_index())
