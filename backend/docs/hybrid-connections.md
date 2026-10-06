@@ -1,6 +1,8 @@
-# 환경별 DB·Redis 연결 계약
+# 환경별 DB·Redis 프로토콜 연결 계약
 
 이 변경은 App #1의 고정 접속 대상 검사를 환경별 **정확한 승인 대상** 검사로 바꾼다. 같은 Source/Image로 Cloud, 실습, 격리 복구 대상에 연결하도록 준비하며, 대상·계정·드라이버·옵션 검사와 CA/Hostname 검증을 유지한다. 실제 Image Build/Scan, lab Ready/Migration/게임, RDS/ElastiCache, Offline Recovery의 완료 판정은 별도다.
+
+현재 Cloud·lab·Recovery의 목표 엔진은 **Valkey 7.2 계열**이다. [Data 계약과 Source](https://github.com/seokpan/seokpan-hybrid-infra/issues/19)는 Infra #37로 전환됐고, App의 `redis-py`·`SEOKPAN_REDIS_*`·`rediss://` 인터페이스는 유지한다. 엔진 선택·코드 병합을 실제 호환성·배포 성공으로 승계하지 않는다.
 
 ## 입력
 
@@ -31,7 +33,7 @@ Migration CLI의 `--expect-host`, `--expect-port`, `--expect-database`는 환경
 
 - `legacy`는 1차 공식 DB/Redis 대상과 기존 기본 동작을 유지한다. 다른 Expected Host 설정만 넣어도 legacy 검사를 우회할 수 없다.
 - 모든 비legacy Profile은 Redis TLS+별도 AUTH+CA를 요구한다. 평문 허용 Switch는 없다.
-- 현재 원 lab의 평문 Redis를 이 변경과 바로 연결할 수 없다. C/D가 별도 lab Redis의 TLS/AUTH·CA·DNS/SAN을 준비한 뒤 수정 Image로 GitOps #6의 Ready/Migration/게임을 시험한다. 기존 lab MariaDB를 재시작·삭제하거나 1차 Redis를 변경하는 작업은 포함하지 않는다.
+- 원 lab의 평문 Redis는 이 계약에 연결하지 않는다. D의 lab Valkey Image·TLS/AUTH·CA 공급 보고와 별도 서버 선언/실제 Ready를 구분한다. B/C는 선언·접속 계약을 검토하고 실제 Data/Schema·권한·사용창을 수락한 뒤 GitOps #6에서 같은 승인 Image의 Ready/Migration/게임을 시험한다. 기존 lab MariaDB를 재시작·삭제하거나 1차 Redis를 변경하는 작업은 포함하지 않는다.
 - Recovery는 C가 준비하는 새 격리 Redis를 사용한다. Cloud Endpoint/Secret 참조를 복구 Overlay에 복사하지 않으며, 실제 Recovery Host/CA/AUTH 공급과 장애 전 보존은 별도 입력이다.
 - CA/AUTH/대상 변경은 새 Config/Secret 개정과 Pod 재기동으로 반영한다. 기존 연결 Pool을 실행 중 자동 갱신하는 기능은 추가하지 않는다.
 
@@ -53,4 +55,4 @@ uv run --frozen pytest -q
 
 Redis TLS는 고정 Driver가 실제로 사용할 SSLContext의 MemoryBIO Handshake로 정상·만료·미래·잘못된 Host를 확인하고, loopback의 합성 TLS/RESP 서버와 실제 redis-py Client로 TLS+AUTH+PING 및 잘못된 AUTH/CA/Hostname의 거부를 확인한다. CA/Hostname이 실패하면 AUTH가 전송되지 않는다. 생성하는 시험 인증서/Key는 임시 경로의 합성 자료다.
 
-합성 서버는 Redis OSS/ElastiCache를 대체하지 않는다. 실제 RDS/Redis OSS 7.1/ElastiCache 연결·Failover·DNS 재해석·장시간 Pool, Image Build/Scan, ROSA 배포, 게임 완주, Backup/Offline RTO/RPO는 이번 로컬 시험으로 PASS 처리하지 않는다. TLS 연결 부분은 `redis-py 8.1.0`의 `_connection_arguments`에 의존하므로 Driver 업데이트 때 해당 선택·Handshake·AUTH·종료 시험을 다시 실행한다.
+합성 서버는 Redis OSS/ElastiCache를 대체하지 않는다. 당시 Redis OSS 후보와 현재 Valkey 7.2를 구분하며, 실제 RDS/선택 Valkey/ElastiCache 연결·Failover·DNS 재해석·장시간 Pool, Image Build/Scan, ROSA 배포, 게임 완주, Backup/Offline RTO/RPO는 이번 로컬 시험으로 PASS 처리하지 않는다. TLS 연결 부분은 `redis-py 8.1.0`의 `_connection_arguments`에 의존하므로 Driver 업데이트 때 해당 선택·Handshake·AUTH·종료 시험을 다시 실행한다.
