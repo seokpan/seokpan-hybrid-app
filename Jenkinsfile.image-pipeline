@@ -756,11 +756,18 @@ PYEOF
                                                 script: "python3 scripts/image_registry.py untag-harbor --component ${component} --final-tag ${env.FINAL_TAG} --tag ${env.CANDIDATE_TAG}"
                                             ).trim()
                                             echo cleanup
-                                            def match = (cleanup =~ /CLEANUP_STATUS=${component}=(OK|ALREADY_ABSENT)/)
-                                            if (!match) {
+                                            // Matcher는 Serializable이 아니라 CPS Step(writeFile 등) 호출 시
+                                            // NotSerializableException을 일으킨다. 문자열 비교만 사용한다.
+                                            def cleanupStatus = ''
+                                            if (cleanup.contains("CLEANUP_STATUS=${component}=ALREADY_ABSENT")) {
+                                                cleanupStatus = 'ALREADY_ABSENT'
+                                            } else if (cleanup.contains("CLEANUP_STATUS=${component}=OK")) {
+                                                cleanupStatus = 'OK'
+                                            }
+                                            if (cleanupStatus == '') {
                                                 error("[${component}] Harbor Candidate 정리 결과를 확인하지 못했습니다: ${cleanup}")
                                             }
-                                            writeFile file: ".ci/state/${component}.harbor-cleanup", text: match[0][1]
+                                            writeFile file: ".ci/state/${component}.harbor-cleanup", text: cleanupStatus
                                         }
                                     }
                                 }
