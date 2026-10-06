@@ -1,3 +1,812 @@
-// 1차 Image Pipeline 원본은 reference/phase1-ci에 보존한다.
-// hybrid-app #2의 ECR/Harbor/Promotion 전환 후 새 구현으로 교체한다.
-error('2차 Image Pipeline 이관 미완료: hybrid-app #2를 완료하기 전에는 실행할 수 없습니다.')
+// 작성자: 최유준
+// 작성 날짜: 2026-10-06
+//
+// ============================================================================
+// seokpan-hybrid-app :: main Image Pipeline (ECR Primary + Harbor Recovery)
+//
+// hybrid-app #2 결정 A~F (B 최신 리뷰) 기준:
+//   A1 한 Build 결과를 ECR과 Harbor에 함께 Push, Scan/Smoke는 Harbor 사본으로 수행
+//   B1 Harbor는 Recovery Registry. 승인 Release만 장기 보존, 비승인 Candidate는 정리
+//   C3 CI IAM에 BatchDeleteImage 없음 -> ECR Candidate tag는 삭제하지 않는다
+//      (ECR tag는 IMMUTABLE. 같은 Digest에 git-* Final tag만 추가한다)
+//   D  버전 고정 aws-cli Container를 이 Jenkinsfile의 inline Pod에 추가
+//      (1차 공유 Pod Template은 수정하지 않는다)
+//   E  2차 전용 Jenkins Folder 범위 Credential (등록 방식은 실측 후 확정)
+//   F  GitOps Writer PAT는 별도 Stage/작업 범위 (이 Pipeline에서는 사용하지 않음)
+//
+// 흐름:
+//   main Commit
+//     -> P1 Revalidation (App CI Check 전체 재실행)
+//     -> Registry Auth (ECR token + Harbor 인증을 합친 DOCKER_CONFIG)
+//     -> Guard (ECR/Harbor Final tag 존재 확인, 부분 상태는 중단)
+//     -> Candidate Build/Push (ECR + Harbor 동시, SBOM/Provenance)
+//     -> Registry별 Candidate Digest/Platform 기록
+//     -> Trivy Scan (Harbor Candidate)  -> Health Process Smoke (Harbor Candidate)
+//     -> Promote: Harbor Final tag -> ECR Final tag (같은 Digest에 tag 추가)
+//     -> Registry별 Final Digest 검증 + Harbor Candidate tag 정리
+//     -> image-metadata.json Evidence
+//
+// Fail-closed:
+//   - PR context / non-main 실행 금지, P1 실패 시 Image 작업 금지
+//   - CRITICAL 또는 수정 가능한 HIGH 발견 시 Promote 금지
+//   - Health Smoke 실패 시 Promote 금지
+//   - 한 Registry에만 Final이 있는 부분 상태는 자동 복구하지 않고 중단
+//   - Platform을 판별하지 못하면 Evidence 기록 중단
+//
+// 이 Pipeline이 하지 않는 것 (별도 작업):
+//   - hybrid-gitops Promotion PR (구조가 1차와 달라 scripts/promote_gitops.py 개정 필요).
+//     Evidence는 gitops_change=NONE으로 남긴다. Cloud는 ecr.final_digest,
+//     Recovery는 harbor.final_digest를 사용하며 두 Digest가 같다고 가정하지 않는다.
+//   - Harbor 비승인 Artifact Retention, ECR Lifecycle 최종 N (Preview 후 확정)
+//
+// 실행 모드 (Build Parameter ENABLE_ECR, 기본 false):
+//   - false (기본): Harbor-only. Build/Scan/Smoke/Promote/Evidence를 Harbor에서만 수행한다.
+//       10/7 OCP 사전검증용 Image/Digest 인계 경로. aws-cli Container와 ECR Credential이 필요 없다.
+//   - true: ECR + Harbor 동시 (결정 A1/B1/C3). aws-cli Pin과 ECR Credential이 준비된 뒤에만 켠다.
+//   Multibranch에서 Parameter는 Jenkinsfile 반영 후 첫 Run은 기본값(false)으로 실행된다.
+//
+// 병합 전 확인이 필요한 값 (아래 TODO 참고):
+//   - ENABLE_ECR=true 사용 시: aws-cli Image 버전/Digest 고정 (Placeholder 문자열이 남아 있으면 중단)
+//   - HARBOR_PROJECT, Credential ID 두 개 (결정 E 실측 후 확정)
+//   - 2차 Harbor Project용 Pull Secret 이름 (Smoke Pod)
+//
+// PR 검사용 Jenkinsfile은 별도 Job이며 이 파일과 무관하다.
+// ============================================================================
+
+def COMPONENTS = ['backend', 'frontend']
+
+// ECR 연동 여부 (Build Parameter). 기본 false = Harbor-only.
+def ecrOn() { return params.ENABLE_ECR == true }
+
+// Harbor-only일 때는 aws-cli Container를 Pod에 넣지 않는다 (Pin 전 Placeholder Image로 Pod가 실패하지 않게).
+def EMPTY_POD_YAML = 'spec: {}'
+def AWS_CLI_POD_YAML = '''
+spec:
+  containers:
+  - name: aws-cli
+    # TODO(#2 D): 아래 image의 버전과 Digest Placeholder를 실제 값으로 고정한다.
+    image: "public.ecr.aws/aws-cli/aws-cli:PIN_BEFORE_MERGE_VERSION@sha256:PIN_BEFORE_MERGE_DIGEST"
+    command: ["cat"]
+    tty: true
+    securityContext:
+      runAsUser: 1000
+    env:
+    - name: HOME
+      value: /tmp
+    - name: AWS_PAGER
+      value: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+'''
+
+// Health Smoke 대상 설정값 (docs/ci-verification.md 기준 고정값)
+def HEALTH_CFG = [
+    backend : [port: 8000, uid: 10001, path: '/health/live'],
+    frontend: [port: 8080, uid: 101,   path: '/health/live']
+]
+
+// Smoke Pod가 Harbor에서 Candidate를 받을 때 사용할 Pull Secret.
+// TODO(#2 E): 2차 Harbor Project 전용 Recovery Pull Robot Secret이 생기면 이름을 확정한다.
+def SMOKE_PULL_SECRETS = ['harbor-pull-secret', 'hybrid-harbor-pull-secret']
+
+pipeline {
+    agent none
+
+    parameters {
+        booleanParam(
+            name: 'ENABLE_ECR',
+            defaultValue: false,
+            description: 'true: ECR+Harbor 동시 Push/Promote (aws-cli Pin·ECR Credential 필요). false: Harbor-only.'
+        )
+    }
+
+    options {
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+        disableRestartFromStage()
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        HARBOR_HOST           = 'harbor.seokpan.soldesk.store'
+        // TODO(#2): 2차 전용 Harbor Project 이름 확정
+        HARBOR_PROJECT        = 'seokpan-hybrid'
+        HARBOR_CA_PATH        = '/etc/buildkit/certs/ca.crt'
+        // TODO(#2 E): 2차 전용 Folder Credential ID 확정 (usernamePassword)
+        HARBOR_PUBLISHER_CRED = 'hybrid-harbor-publisher'
+        // TODO(#2 E): AWS Access Key를 usernamePassword(ID/Secret)로 보관하는 Folder Credential
+        ECR_CI_CRED           = 'hybrid-ecr-ci-aws'
+        AWS_REGION            = 'ap-northeast-2'
+        ECR_REPO_PREFIX       = 'seokpan-fnd-'
+        ECR_PASSWORD_FILE     = '.ci/ecr-password'
+    }
+
+    stages {
+
+        // --------------------------------------------------------------
+        // Branch Guard + 변수 준비. 가벼운 작업이라 buildkit-rootless 재사용.
+        // --------------------------------------------------------------
+        stage('Branch Guard & Prepare') {
+            agent { kubernetes { inheritFrom 'buildkit-rootless' } }
+            steps {
+                script {
+                    if (env.CHANGE_ID) {
+                        error("이 Pipeline은 PR 컨텍스트(CHANGE_ID=${env.CHANGE_ID})에서 실행되면 안 됩니다.")
+                    }
+                    if (env.BRANCH_NAME != 'main') {
+                        error("이 Pipeline은 main 브랜치 전용입니다 (현재 BRANCH_NAME=${env.BRANCH_NAME}).")
+                    }
+                    echo "Branch Guard 통과: BRANCH_NAME=main, PR 컨텍스트 아님"
+
+                    def scmVars = checkout scm
+                    env.SEOKPAN_GIT_SHA   = scmVars.GIT_COMMIT
+                    env.SEOKPAN_CI_RUN_ID = "a09-${env.BUILD_NUMBER}-${env.SEOKPAN_GIT_SHA.take(12)}"
+                    env.MAIN_SHA_12       = env.SEOKPAN_GIT_SHA.take(12)
+                    env.CANDIDATE_TAG     = "scan-${env.MAIN_SHA_12}-${env.BUILD_NUMBER}"
+                    env.FINAL_TAG         = "git-${env.MAIN_SHA_12}"
+                    echo "Commit: ${env.SEOKPAN_GIT_SHA}"
+                    echo "RUN_ID: ${env.SEOKPAN_CI_RUN_ID}"
+                    echo "Candidate tag: ${env.CANDIDATE_TAG} / Final tag: ${env.FINAL_TAG}"
+
+                    // aws-cli Image가 고정되기 전에는 Registry 작업을 시작하지 않는다.
+                    // (패턴을 둘로 나눠 이 검사 줄 자체와 일치하지 않게 한다)
+                    echo "ENABLE_ECR=${ecrOn()} (false = Harbor-only)"
+                    if (ecrOn()) {
+                        sh '''
+                            set -eu
+                            if grep -n 'PIN_BEFORE_''MERGE' Jenkinsfile.image-pipeline; then
+                                echo "ERROR: aws-cli Image 버전/Digest가 아직 고정되지 않았습니다." >&2
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // P1 Revalidation: docs/ci-verification.md 기준 App CI Check 6단계 전체를
+        // main pinned commit에 재적용 (1차 Pipeline과 동일, app-ci-check Agent 재사용).
+        // --------------------------------------------------------------
+        stage('P1 Revalidation (App CI Check on main)') {
+            agent { kubernetes { inheritFrom 'app-ci-check' } }
+            environment {
+                HOME = '/tmp'
+            }
+            stages {
+                stage('Checkout') {
+                    steps {
+                        container('app-ci') {
+                            script {
+                                def scmVars = checkout scm
+                                if (scmVars.GIT_COMMIT != env.SEOKPAN_GIT_SHA) {
+                                    error("Commit mismatch on app-ci-check agent: expected ${env.SEOKPAN_GIT_SHA}, got ${scmVars.GIT_COMMIT}")
+                                }
+                                sh 'id'
+                                echo "commit=${env.SEOKPAN_GIT_SHA} run_id=${env.SEOKPAN_CI_RUN_ID}"
+                            }
+                        }
+                    }
+                }
+
+                stage('Prepare Browser Cache') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                sh '''
+                                    set -eu
+                                    SRC="/opt/playwright-cache"
+                                    DEST=".browser-cache"
+
+                                    if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+                                        echo "ERROR: $DEST already exists in a fresh workspace. Aborting." >&2
+                                        exit 1
+                                    fi
+
+                                    START=$(date +%s)
+                                    SRC_SIZE=$(du -sh "$SRC" | cut -f1)
+                                    cp -r "$SRC" "$DEST"
+                                    END=$(date +%s)
+                                    echo "browser-cache copy: ${SRC_SIZE}, $((END-START))s, src=${SRC}"
+
+                                    REVISION_DIR="$DEST/chromium_headless_shell-1243"
+                                    [ -d "$REVISION_DIR" ] || { echo "ERROR: revision 1243 missing" >&2; exit 1; }
+                                    BIN=$(find "$REVISION_DIR" -type f -name "headless_shell" -o -name "chrome-headless-shell" | head -1)
+
+                                    [ -n "$BIN" ] && [ -x "$BIN" ] || { echo "ERROR: binary missing/not executable" >&2; exit 1; }
+                                    if ldd "$BIN" 2>&1 | grep -q "not found"; then
+                                        echo "ERROR: missing shared libraries:" >&2
+                                        ldd "$BIN" | grep "not found" >&2
+                                        exit 1
+                                    fi
+
+                                    if touch "$SRC/.write-test" 2>/dev/null; then
+                                        echo "ERROR: source is writable by CI UID - security regression" >&2
+                                        exit 1
+                                    fi
+                                    echo "source read-only confirmed"
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Backend: Install & Verify') {
+                    steps {
+                        container('app-ci') {
+                            dir('backend') {
+                                sh 'python scripts/verify_ci.py --run-id ${SEOKPAN_CI_RUN_ID} --uv /usr/local/bin/uv'
+                            }
+                        }
+                    }
+                }
+
+                stage('OpenAPI Export') {
+                    steps {
+                        container('app-ci') {
+                            dir('backend') {
+                                sh '.venv/bin/python scripts/export_openapi_ci.py --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Frontend: Install & Verify') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                // verify:ci가 Format/Lint/TypeCheck/도구시험/기능시험/Build/Audit까지 포함
+                                sh 'npm run verify:ci -- --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Browser: UI') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                sh 'npm run e2e:ci -- ui --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Browser: Full') {
+                    steps {
+                        container('app-ci') {
+                            dir('frontend') {
+                                sh 'npm run e2e:ci -- full --run-id ${SEOKPAN_CI_RUN_ID}'
+                            }
+                        }
+                    }
+                }
+
+                stage('Aggregate') {
+                    steps {
+                        container('app-ci') {
+                            dir('backend') {
+                                script {
+                                    env.P1_AGGREGATE_ATTEMPTED = 'true'
+                                    sh 'python scripts/summarize_ci.py --run-id ${SEOKPAN_CI_RUN_ID}'
+                                }
+                            }
+                            archiveArtifacts(
+                                artifacts: "test-results/${env.SEOKPAN_CI_RUN_ID}/**",
+                                fingerprint: true
+                            )
+                            script { env.P1_PASSED = 'true' }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        try {
+                            container('app-ci') {
+                                if (env.P1_AGGREGATE_ATTEMPTED != 'true') {
+                                    dir('backend') {
+                                        sh 'python scripts/summarize_ci.py --run-id ${SEOKPAN_CI_RUN_ID} || true'
+                                    }
+                                }
+                                archiveArtifacts(
+                                    artifacts: "test-results/${env.SEOKPAN_CI_RUN_ID}/**",
+                                    allowEmptyArchive: true,
+                                    fingerprint: true
+                                )
+                            }
+                        } catch (Exception e) {
+                            echo "WARN: fallback collection skipped (agent/container unavailable): ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Image Build & Registry Operations
+        //   buildkit-rootless(1차 공유 Template)를 상속하고 aws-cli Container만
+        //   inline YAML로 추가한다 (결정 D). 공유 Template은 수정하지 않는다.
+        //   상태 파일(.ci/state)로 Stage 간 값을 전달한다. env["동적키"] 대입은
+        //   Groovy Sandbox에서 막히므로 컴포넌트별 값은 env에 두지 않는다.
+        // --------------------------------------------------------------
+        stage('Image Build & Registry Operations') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { env.P1_PASSED == 'true' }
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                }
+            }
+            agent {
+                kubernetes {
+                    inheritFrom 'buildkit-rootless'
+                    yamlMergeStrategy merge()
+                    yaml (ecrOn() ? AWS_CLI_POD_YAML : EMPTY_POD_YAML)
+                }
+            }
+            stages {
+
+                // 새 Agent에서도 Branch Guard가 고정한 정확한 Commit만 받는다.
+                stage('Checkout (pinned main SHA)') {
+                    steps {
+                        script {
+                            checkout([
+                                $class: 'GitSCM',
+                                branches: [[name: env.SEOKPAN_GIT_SHA]],
+                                userRemoteConfigs: [[url: scm.userRemoteConfigs[0].url]]
+                            ])
+                            def actualSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                            if (actualSha != env.SEOKPAN_GIT_SHA) {
+                                error "Commit mismatch: expected ${env.SEOKPAN_GIT_SHA}, got ${actualSha}"
+                            }
+                        }
+                    }
+                }
+
+                // Registry 보조 도구는 사용 전에 자체 시험을 통과해야 한다.
+                stage('Registry Helper Self-Test') {
+                    steps {
+                        container('python') {
+                            sh '''
+                                set -eu
+                                python3 --version
+                                python3 scripts/test_image_registry.py
+                            '''
+                        }
+                    }
+                }
+
+                // ECR token(12시간 유효)은 이 Run 안에서만 쓴다. Workspace의 .ci/는 Pod와 함께 사라지고
+                // post에서도 지운다. 1차 Harbor Secret(harbor-robot-dockerconfig)은 사용하지 않는다.
+                stage('Registry Auth') {
+                    steps {
+                        script {
+                            if (ecrOn()) {
+                                container('aws-cli') {
+                                    withCredentials([usernamePassword(
+                                        credentialsId: env.ECR_CI_CRED,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                                    )]) {
+                                        sh '''
+                                            set -eu
+                                            umask 077
+                                            mkdir -p .ci/state
+                                            ACCOUNT="$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)"
+                                            case "$ACCOUNT" in
+                                                [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+                                                *) echo "ERROR: unexpected AWS account id" >&2; exit 1 ;;
+                                            esac
+                                            echo "${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com" > .ci/ecr-registry
+                                            aws ecr get-login-password --region "$AWS_REGION" > "$ECR_PASSWORD_FILE"
+                                            [ -s "$ECR_PASSWORD_FILE" ] || { echo "ERROR: empty ECR token" >&2; exit 1; }
+                                        '''
+                                    }
+                                }
+                                env.ECR_REGISTRY = readFile('.ci/ecr-registry').trim()
+                                echo "ECR registry: ${env.ECR_REGISTRY}"
+                            }
+                        }
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_PUBLISHER_CRED,
+                                usernameVariable: 'HARBOR_USER',
+                                passwordVariable: 'HARBOR_PASS'
+                            )]) {
+                                script {
+                                    sh 'umask 077; mkdir -p .ci/state'
+                                    def ecrFlag = ecrOn() ? '--enable-ecr' : ''
+                                    sh "python3 scripts/image_registry.py docker-config --out-dir .ci/dockercfg ${ecrFlag}"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ECR와 Harbor 양쪽의 Final tag를 확인한다.
+                //   둘 다 있음  -> 재실행 복구로 재사용 (Build/Scan/Smoke/Promote 생략)
+                //   둘 다 없음  -> 이번 Run에서 처리
+                //   한쪽만 있음/조회 오류 -> 자동 복구하지 않고 중단 (ECR tag는 Immutable)
+                stage('Guard: Final Tag Check (ECR + Harbor)') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_PUBLISHER_CRED,
+                                usernameVariable: 'HARBOR_USER',
+                                passwordVariable: 'HARBOR_PASS'
+                            )]) {
+                                script {
+                                    for (component in COMPONENTS) {
+                                        def harborStatus = sh(
+                                            returnStatus: true,
+                                            script: "python3 scripts/image_registry.py describe --registry harbor --component ${component} --tag ${env.FINAL_TAG} --out .ci/state/${component}.harbor.final.json"
+                                        )
+                                        // Harbor-only에서는 ECR 판정을 Harbor와 같게 둔다.
+                                        def ecrStatus = harborStatus
+                                        if (ecrOn()) {
+                                            ecrStatus = sh(
+                                                returnStatus: true,
+                                                script: "python3 scripts/image_registry.py describe --registry ecr --component ${component} --tag ${env.FINAL_TAG} --out .ci/state/${component}.ecr.final.json"
+                                            )
+                                        }
+                                        echo "Guard [${component}] ecr=${ecrStatus} harbor=${harborStatus} (0=있음, 3=없음)"
+                                        if (ecrStatus == 0 && harborStatus == 0) {
+                                            writeFile file: ".ci/state/${component}.reused", text: 'true'
+                                            echo "Guard [${component}]: ECR/Harbor 양쪽에 ${env.FINAL_TAG} 존재. 기존 Final을 재사용한다."
+                                        } else if (ecrStatus == 3 && harborStatus == 3) {
+                                            echo "Guard [${component}]: Final 없음. 이번 Run에서 처리한다."
+                                        } else {
+                                            error(
+                                                "Guard [${component}]: 부분/비정상 상태 (ecr=${ecrStatus}, harbor=${harborStatus}). " +
+                                                "한 Registry에만 Final이 있거나 조회 오류입니다. ECR tag는 Immutable이므로 " +
+                                                "자동 복구하지 않고 중단합니다. 상태를 확인한 뒤 수동으로 정리하세요."
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 한 번의 Build로 ECR/Harbor 두 이름에 동시에 Push한다 (결정 A1).
+                // buildkit 컨테이너의 SSL_CERT_FILE은 Harbor CA 하나만 가리키므로 그대로 두면
+                // ECR(Amazon CA) TLS 검증이 실패한다. 시스템 CA + Harbor CA를 합친 번들을 쓴다.
+                stage('Build & Push Candidate (ECR + Harbor)') {
+                    steps {
+                        container('buildkit') {
+                            script {
+                                for (component in COMPONENTS) {
+                                    if (fileExists(".ci/state/${component}.reused")) {
+                                        echo "[${component}] 기존 Final 재사용 - Candidate Build/Push 생략"
+                                    } else {
+                                        withEnv(["COMPONENT=${component}", "ENABLE_ECR_FLAG=${ecrOn()}"]) {
+                                            sh '''
+                                                set -eu
+                                                SYSTEM_CA=/etc/ssl/certs/ca-certificates.crt
+                                                [ -s "$SYSTEM_CA" ] || { echo "ERROR: system CA bundle not found" >&2; exit 1; }
+                                                [ -s "$HARBOR_CA_PATH" ] || { echo "ERROR: Harbor CA not found" >&2; exit 1; }
+                                                cat "$SYSTEM_CA" "$HARBOR_CA_PATH" > .ci/ca-bundle.crt
+                                                export SSL_CERT_FILE="$PWD/.ci/ca-bundle.crt"
+                                                export DOCKER_CONFIG="$PWD/.ci/dockercfg"
+                                                [ -s "$DOCKER_CONFIG/config.json" ] || { echo "ERROR: docker config missing" >&2; exit 1; }
+
+                                                HARBOR_REF="${HARBOR_HOST}/${HARBOR_PROJECT}/${COMPONENT}:${CANDIDATE_TAG}"
+                                                if [ "${ENABLE_ECR_FLAG:-false}" = "true" ]; then
+                                                    ECR_REF="${ECR_REGISTRY}/${ECR_REPO_PREFIX}${COMPONENT}:${CANDIDATE_TAG}"
+                                                    OUTPUT="$(printf 'type=image,"name=%s,%s",push=true' "$HARBOR_REF" "$ECR_REF")"
+                                                else
+                                                    OUTPUT="type=image,name=${HARBOR_REF},push=true"
+                                                fi
+
+                                                buildctl-daemonless.sh build \\
+                                                  --frontend dockerfile.v0 \\
+                                                  --local context=./${COMPONENT} \\
+                                                  --local dockerfile=./${COMPONENT} \\
+                                                  --opt attest:sbom=generator=docker.io/docker/buildkit-syft-scanner@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9 \\
+                                                  --opt attest:provenance=mode=min \\
+                                                  --metadata-file ".ci/state/${COMPONENT}.build.json" \\
+                                                  --output "$OUTPUT"
+                                            '''
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Registry별 Candidate Digest/Platform을 각각 조회해 기록한다.
+                // 두 Registry의 Digest가 같다고 가정하지 않는다 (Evidence에 각각 기록).
+                stage('Record Candidate Digests (ECR + Harbor)') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_PUBLISHER_CRED,
+                                usernameVariable: 'HARBOR_USER',
+                                passwordVariable: 'HARBOR_PASS'
+                            )]) {
+                                script {
+                                    for (component in COMPONENTS) {
+                                        if (!fileExists(".ci/state/${component}.reused")) {
+                                            sh "python3 scripts/image_registry.py describe --registry harbor --component ${component} --tag ${env.CANDIDATE_TAG} --out .ci/state/${component}.harbor.candidate.json --must-exist"
+                                            if (ecrOn()) {
+                                                sh "python3 scripts/image_registry.py describe --registry ecr --component ${component} --tag ${env.CANDIDATE_TAG} --out .ci/state/${component}.ecr.candidate.json --must-exist"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Scan은 Harbor 사본으로 수행한다 (결정 A1: cicd Namespace에 ECR token을 추가하지 않는다).
+                stage('Scan (Harbor Candidate)') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_PUBLISHER_CRED,
+                                usernameVariable: 'HARBOR_USER',
+                                passwordVariable: 'HARBOR_PASS'
+                            )]) {
+                                script {
+                                    for (component in COMPONENTS) {
+                                        if (fileExists(".ci/state/${component}.reused")) {
+                                            writeFile file: ".ci/state/${component}.scan", text: 'SKIPPED_EXISTING_FINAL'
+                                        } else {
+                                            withEnv(["COMPONENT=${component}"]) {
+                                                sh '''
+                                                    set -eu
+                                                    export SSL_CERT_FILE="${HARBOR_CA_PATH}"
+                                                    export TRIVY_USERNAME="$HARBOR_USER"
+                                                    export TRIVY_PASSWORD="$HARBOR_PASS"
+                                                    IMAGE_REF="${HARBOR_HOST}/${HARBOR_PROJECT}/${COMPONENT}:${CANDIDATE_TAG}"
+                                                    REPORT_FILE="/tmp/trivy-${COMPONENT}.json"
+
+                                                    trivy image \\
+                                                      --scanners vuln \\
+                                                      --format json --severity CRITICAL,HIGH --exit-code 0 \\
+                                                      --output "${REPORT_FILE}" "${IMAGE_REF}"
+
+                                                    python3 scripts/image_registry.py scan-summary \\
+                                                      --report "${REPORT_FILE}" --component "${COMPONENT}" \\
+                                                      --out ".ci/state/${COMPONENT}.scan"
+                                                '''
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Candidate Health Process Smoke: Scan 통과 Image를 Final Promote 전에 검증한다.
+                // 1차 Pipeline의 검증된 방식을 유지한다 (target 원래 CMD + 같은 Pod의 checker가
+                // /health/live HTTP 200 확인). Smoke 실패 시 Final tag는 만들어지지 않는다.
+                stage('Candidate Health Smoke Test') {
+                    steps {
+                        script {
+                            for (component in COMPONENTS) {
+                                if (fileExists(".ci/state/${component}.reused")) {
+                                    echo "[${component}] 기존 Final 재사용 - Smoke 생략"
+                                    writeFile file: ".ci/state/${component}.health", text: 'SKIPPED_EXISTING_FINAL'
+                                } else {
+                                    def cfg = HEALTH_CFG[component]
+                                    def label = "smoke-${component}-${env.BUILD_NUMBER}"
+                                    def targetImage = "${env.HARBOR_HOST}/${env.HARBOR_PROJECT}/${component}:${env.CANDIDATE_TAG}"
+                                    def checkerImage = "${env.HARBOR_HOST}/seokpan/ci-python@sha256:19349910928096e034c1e45b51f3b446e95e152b2525695afe8fc791914b49a5"
+
+                                    // Smoke Pod의 securityContext는 운영 Deployment의 핵심 제약을 따른다.
+                                    // TODO(#2): hybrid-gitops base(backend.yaml/frontend.yaml)의 securityContext와 재대조.
+                                    // YAML은 줄 목록으로 조립해 들여쓰기 오류를 막는다.
+                                    def secCtx = [
+                                        "runAsUser: ${cfg.uid}",
+                                        "runAsNonRoot: true",
+                                        "readOnlyRootFilesystem: true",
+                                        "allowPrivilegeEscalation: false",
+                                        "capabilities: {drop: [\"ALL\"]}"
+                                    ]
+                                    if (component == 'backend') {
+                                        secCtx << "runAsGroup: ${cfg.uid}"
+                                    }
+                                    def podLines = [
+                                        "apiVersion: v1",
+                                        "kind: Pod",
+                                        "spec:",
+                                        "  securityContext:",
+                                        "    seccompProfile:",
+                                        "      type: RuntimeDefault",
+                                        "  containers:",
+                                        "  - name: target",
+                                        "    image: \"${targetImage}\"",
+                                        "    securityContext:"
+                                    ]
+                                    secCtx.each { podLines << "      ${it}".toString() }
+                                    // SEOKPAN_ENVIRONMENT=test (Settings Literal에 정의됨). DB/Redis 설정은
+                                    // Optional이라 Health Smoke에는 필요 없다. ALLOWED_ORIGINS는 JSON 배열이어야 한다.
+                                    if (component == 'backend') {
+                                        podLines += [
+                                            "    env:",
+                                            "    - name: SEOKPAN_ENVIRONMENT",
+                                            "      value: \"test\"",
+                                            "    - name: SEOKPAN_LOG_LEVEL",
+                                            "      value: \"INFO\"",
+                                            "    - name: SEOKPAN_ALLOWED_ORIGINS",
+                                            "      value: '[\"https://game.seokpan.soldesk.store\"]'"
+                                        ]
+                                    }
+                                    podLines += [
+                                        "    volumeMounts:",
+                                        "    - name: tmp",
+                                        "      mountPath: /tmp",
+                                        "  - name: checker",
+                                        "    image: \"${checkerImage}\"",
+                                        "    command: [\"cat\"]",
+                                        "    tty: true",
+                                        "  volumes:",
+                                        "  - name: tmp",
+                                        "    emptyDir: {}"
+                                    ]
+                                    def podYaml = podLines.collect { it.toString() }.join('\n')
+
+                                    podTemplate(
+                                        label: label,
+                                        namespace: 'cicd',
+                                        imagePullSecrets: SMOKE_PULL_SECRETS,
+                                        yaml: podYaml
+                                    ) {
+                                        node(label) {
+                                            container('checker') {
+                                                sh """
+                                                    python3 - <<'PYEOF'
+import sys
+import time
+import urllib.request
+
+url = "http://localhost:${cfg.port}${cfg.path}"
+deadline = time.time() + 30
+last_error = None
+
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status == 200:
+                print("[${component}] HEALTH=PASS HTTP=200 URL=" + url)
+                sys.exit(0)
+            last_error = RuntimeError(f"HTTP {resp.status}")
+    except Exception as exc:
+        last_error = exc
+
+    time.sleep(2)
+
+print(
+    f"[${component}] HEALTH=FAIL URL={url} last_error={last_error}",
+    file=sys.stderr,
+)
+sys.exit(1)
+PYEOF
+                                                """
+                                            }
+                                        }
+                                    }
+                                    // podTemplate/node 블록 밖(원래 Agent)에서 기록해야 .ci/state에 남는다.
+                                    writeFile file: ".ci/state/${component}.health", text: 'PASS_PROCESS_SMOKE'
+                                    echo "[${component}] Candidate Health Process Smoke PASS"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Promote: 같은 Digest에 Final tag를 추가한다. 영구적인 ECR(Immutable)을 마지막에 둔다.
+                stage('Promote (Harbor -> ECR)') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_PUBLISHER_CRED,
+                                usernameVariable: 'HARBOR_USER',
+                                passwordVariable: 'HARBOR_PASS'
+                            )]) {
+                                script {
+                                    for (component in COMPONENTS) {
+                                        if (fileExists(".ci/state/${component}.reused")) {
+                                            echo "[${component}] 기존 Final 재사용 - Promote 생략"
+                                        } else {
+                                            sh "python3 scripts/image_registry.py promote --registry harbor --component ${component} --from-tag ${env.CANDIDATE_TAG} --to-tag ${env.FINAL_TAG}"
+                                            if (ecrOn()) {
+                                                sh "python3 scripts/image_registry.py promote --registry ecr --component ${component} --from-tag ${env.CANDIDATE_TAG} --to-tag ${env.FINAL_TAG}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Registry별 Final Digest가 같은 Registry의 Candidate Digest와 같은지 확인한다.
+                // Harbor Candidate tag는 정리한다 (결정 B1). ECR Candidate tag는 삭제 권한이 없어 유지한다 (C3).
+                stage('Verify Final Digests & Cleanup Harbor Candidate') {
+                    steps {
+                        container('python') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.HARBOR_PUBLISHER_CRED,
+                                usernameVariable: 'HARBOR_USER',
+                                passwordVariable: 'HARBOR_PASS'
+                            )]) {
+                                script {
+                                    for (component in COMPONENTS) {
+                                        if (!fileExists(".ci/state/${component}.reused")) {
+                                            sh "python3 scripts/image_registry.py verify-final --registry harbor --component ${component} --candidate-file .ci/state/${component}.harbor.candidate.json --final-tag ${env.FINAL_TAG} --out .ci/state/${component}.harbor.final.json"
+                                            if (ecrOn()) {
+                                                sh "python3 scripts/image_registry.py verify-final --registry ecr --component ${component} --candidate-file .ci/state/${component}.ecr.candidate.json --final-tag ${env.FINAL_TAG} --out .ci/state/${component}.ecr.final.json"
+                                            }
+                                            def cleanup = sh(
+                                                returnStdout: true,
+                                                script: "python3 scripts/image_registry.py untag-harbor --component ${component} --final-tag ${env.FINAL_TAG} --tag ${env.CANDIDATE_TAG}"
+                                            ).trim()
+                                            echo cleanup
+                                            def match = (cleanup =~ /CLEANUP_STATUS=${component}=(OK|ALREADY_ABSENT)/)
+                                            if (!match) {
+                                                error("[${component}] Harbor Candidate 정리 결과를 확인하지 못했습니다: ${cleanup}")
+                                            }
+                                            writeFile file: ".ci/state/${component}.harbor-cleanup", text: match[0][1]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Evidence: Registry별 Digest/Platform, Scan/Smoke 결과를 구조화해 남긴다.
+                stage('Record Commit-Build-Tag-Digest Evidence') {
+                    steps {
+                        container('python') {
+                            script {
+                                def extra = []
+                                for (component in COMPONENTS) {
+                                    def reused = fileExists(".ci/state/${component}.reused")
+                                    extra << "--reused ${component}=${reused}"
+                                    if (!reused) {
+                                        extra << "--harbor-cleanup ${component}=${readFile(".ci/state/${component}.harbor-cleanup").trim()}"
+                                    }
+                                }
+                                if (ecrOn()) { extra << '--enable-ecr' }
+                                sh "python3 scripts/image_registry.py evidence --state-dir .ci/state --candidate-tag ${env.CANDIDATE_TAG} --final-tag ${env.FINAL_TAG} ${extra.join(' ')} --out image-metadata.json"
+                                archiveArtifacts artifacts: 'image-metadata.json', fingerprint: true
+                                archiveArtifacts artifacts: '.ci/state/*.json', allowEmptyArchive: true
+                                echo 'Evidence 기록 완료: image-metadata.json'
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    // 인증 자료는 Run이 끝나면 Workspace에서 지운다 (archive 대상은 .ci/state/*.json뿐).
+                    sh 'rm -rf .ci/dockercfg .ci/ecr-password .ci/ca-bundle.crt || true'
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Image Pipeline 실패: ${env.CANDIDATE_TAG ?: 'N/A'} / ${env.FINAL_TAG ?: 'N/A'} (Harbor Candidate는 Retention 정책, ECR Candidate는 Lifecycle로 정리)"
+        }
+        success {
+            echo "Image Pipeline 성공: ${env.FINAL_TAG} Final 상태 정상. 상세는 image-metadata.json 참고 (gitops_change=NONE)"
+        }
+    }
+}
