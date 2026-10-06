@@ -184,7 +184,13 @@ def fetch_manifest(reg: Registry, component: str, ref: str) -> Manifest | None:
         codes = _error_codes(body)
         if "MANIFEST_UNKNOWN" in codes:
             return None
-        # NAME_UNKNOWN(Repository 없음)이나 해석 불가 응답을 "tag 없음"으로 취급하지 않는다.
+        # Harbor는 Repository가 첫 Push 때 만들어지므로, 새 Project의 첫 Run에서는
+        # Repository 자체가 없다(NOT_FOUND/NAME_UNKNOWN). 이를 "tag 없음"으로 본다.
+        # 잘못된 Project 이름이면 이어지는 Push가 실패하므로 fail-closed는 유지된다.
+        # ECR은 Terraform이 Repository를 미리 만들어 두므로 NAME_UNKNOWN을 오류로 유지한다.
+        if reg.kind == "harbor" and any(code in ("NOT_FOUND", "NAME_UNKNOWN") for code in codes):
+            return None
+        # 그 외 404나 해석 불가 응답을 "tag 없음"으로 취급하지 않는다.
         raise RegistryError(
             f"{reg.kind} 404이지만 MANIFEST_UNKNOWN이 아닙니다 "
             f"(codes={codes or '해석 불가'}): Repository/설정을 확인하세요"
