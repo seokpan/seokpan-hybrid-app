@@ -64,8 +64,8 @@ def AWS_CLI_POD_YAML = '''
 spec:
   containers:
   - name: aws-cli
-    # TODO(#2 D): 아래 image의 버전과 Digest Placeholder를 실제 값으로 고정한다.
-    image: "public.ecr.aws/aws-cli/aws-cli:PIN_BEFORE_MERGE_VERSION@sha256:PIN_BEFORE_MERGE_DIGEST"
+    # 고정값: 2.37.9 (멀티 아키텍처 인덱스 Digest, 2026-10-06 cp-03에서 확인). 변경은 별도 Issue/PR로만 한다.
+    image: "public.ecr.aws/aws-cli/aws-cli:2.37.9@sha256:92de75724b6a746951f0e8b915d86bbccd7cb55aff96cd0cb4f7017272160780"
     command: ["cat"]
     tty: true
     securityContext:
