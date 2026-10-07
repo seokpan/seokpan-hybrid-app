@@ -278,7 +278,7 @@ async def test_real_lua_closed_turn_move_converges_before_departure_and_is_redis
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deadline_offset", [-1000, 0])
+@pytest.mark.parametrize("deadline_offset", [-1000, 0, None])
 async def test_real_lua_rejected_next_deadline_preserves_board_and_retry(server, deadline_offset):
     _rooms, votes, r, g, black, _white = await setup(server)
     state = await votes.get(r)
@@ -321,7 +321,7 @@ async def test_real_lua_rejected_next_deadline_preserves_board_and_retry(server,
                 resolution,
                 leased.snapshot.state_version,
                 True,
-                raw["deadline_ms"] + deadline_offset,
+                None if deadline_offset is None else raw["deadline_ms"] + deadline_offset,
             )
         )
     assert await votes.get(r) == before, "rejected continuation must not mutate the board"
@@ -341,3 +341,34 @@ async def test_real_lua_rejected_next_deadline_preserves_board_and_retry(server,
     )
     assert result.snapshot.move_no == 1 and result.snapshot.turn_no == 2
     assert result.snapshot.occupied_cells[0].coordinate == move.coordinate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline_offset", [-1000, 0, None])
+async def test_real_lua_rejected_pass_deadline_preserves_state_and_retry(server, deadline_offset):
+    _rooms, votes, r, g, _black, _white = await setup(server)
+    raw = json.loads(await server.get(RedisKeyspace.room_game(r)))
+    seconds, micros = await server.time()
+    raw["deadline_ms"] = seconds * 1000 + micros // 1000 - 1
+    await server.set(RedisKeyspace.room_game(r), json.dumps(raw))
+    before = await votes.get(r)
+    before_game = await server.get(RedisKeyspace.room_game(r))
+    with pytest.raises(VoteRuleViolation, match="INVALID_NEXT_DEADLINE"):
+        await votes.close_turn(
+            CloseRuntimeTurn(
+                r,
+                "pass-invalid",
+                g,
+                1,
+                before.state_version,
+                None if deadline_offset is None else raw["deadline_ms"] + deadline_offset,
+            )
+        )
+    assert await votes.get(r) == before, "rejected pass must not mutate runtime state"
+    assert await server.get(RedisKeyspace.room_game(r)) == before_game
+    result = await votes.close_turn(
+        CloseRuntimeTurn(r, "pass-valid", g, 1, before.state_version, raw["deadline_ms"] + 5000)
+    )
+    assert result.snapshot.turn_no == 2
+    assert result.snapshot.move_no == 0
+    assert result.snapshot.turn_status is TurnStatus.VOTING
