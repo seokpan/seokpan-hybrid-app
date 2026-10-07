@@ -223,7 +223,11 @@ class RedisRealtimeEventAdapter:
             update_version(version)
         except asyncio.CancelledError:
             # Ownership has not moved to _RedisRealtimeSubscription yet.
-            await pubsub.aclose()  # type: ignore[no-untyped-call]
+            try:
+                await pubsub.aclose()  # type: ignore[no-untyped-call]
+            except RedisError:
+                # Cleanup failure must not replace the cancellation being handled.
+                pass
             raise
         except (RedisError, RealtimeUnavailable):
             await pubsub.aclose()  # type: ignore[no-untyped-call]
