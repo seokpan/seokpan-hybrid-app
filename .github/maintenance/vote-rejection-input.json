@@ -1,0 +1,22 @@
+{
+  "backend/src/seokpan/persistence/redis/vote_scripts.py": {
+    "before_sha256": "6125011201e3cf3b4e93c0684eb48d5684e3b81b5ee33b40652945c1ec064354",
+    "after_sha256": "527f10141079ca17d8434013f49a039a12808086b70b39b25044bc3d0ee3e42a",
+    "edits": [[425,425,"  -- Reject invalid continuation before changing the authoritative board hash.\n  -- Lua execution isolation does not undo writes after an application rejection.\n  if payload.next_game_status == 'ACTIVE'\n      and (payload.next_deadline_ms == nil or payload.next_deadline_ms <= game.deadline_ms) then\n    return rejection('INVALID_NEXT_DEADLINE')\n  end\n"],[444,447,""],[502,503,"    version=10,\n"]]
+  },
+  "backend/tests/integration/test_departure_redis_lua.py": {
+    "before_sha256": "d9220281769533c94e079c21522c8e7ee6bcb5e2dbb9fefe95ba35d8a45f4740",
+    "after_sha256": "a925a36abdb4d99b9c3f2bd01fdf01b443b5f09997710e0c55d8e1df5a2c0674",
+    "edits": [[277,277,"\n\n@pytest.mark.asyncio\n@pytest.mark.parametrize(\"deadline_offset\", [-1000, 0])\nasync def test_real_lua_rejected_next_deadline_preserves_board_and_retry(server, deadline_offset):\n    _rooms, votes, r, g, black, _white = await setup(server)\n    state = await votes.get(r)\n    await votes.cast_vote(\n        CastRuntimeVote(r, \"vote\", g, 1, black, Coordinate.parse(\"A1\"), state.state_version)\n    )\n    raw = json.loads(await server.get(RedisKeyspace.room_game(r)))\n    seconds, micros = await server.time()\n    raw[\"deadline_ms\"] = seconds * 1000 + micros // 1000 - 1\n    await server.set(RedisKeyspace.room_game(r), json.dumps(raw))\n    state = await votes.get(r)\n    await votes.close_turn(\n        CloseRuntimeTurn(r, \"close\", g, 1, state.state_version, raw[\"deadline_ms\"] + 5000)\n    )\n    state = await votes.get(r)\n    leased = await votes.acquire_resolver(\n        AcquireRuntimeResolver(r, \"lease\", g, 1, \"normal\", state.state_version)\n    )\n    move = AppliedMove(1, Stone.BLACK, Coordinate.parse(\"A1\"))\n    resolution = TurnResolution(\n        g,\n        1,\n        Stone.BLACK,\n        TurnResultKind.MOVE_APPLIED,\n        TurnStatus.MOVE_APPLIED,\n        move.coordinate,\n        move,\n        None,\n    )\n    before = await votes.get(r)\n    before_game = await server.get(RedisKeyspace.room_game(r))\n    with pytest.raises(VoteRuleViolation, match=\"INVALID_NEXT_DEADLINE\"):\n        await votes.apply_resolution(\n            ApplyRuntimeResolution(\n                r,\n                \"apply-invalid\",\n                g,\n                1,\n                \"normal\",\n                resolution,\n                leased.snapshot.state_version,\n                True,\n                raw[\"deadline_ms\"] + deadline_offset,\n            )\n        )\n    assert await votes.get(r) == before, \"rejected continuation must not mutate the board\"\n    assert await server.get(RedisKeyspace.room_game(r)) == before_game\n    result = await votes.apply_resolution(\n        ApplyRuntimeResolution(\n            r,\n            \"apply-valid\",\n            g,\n            1,\n            \"normal\",\n            resolution,\n            leased.snapshot.state_version,\n            True,\n            raw[\"deadline_ms\"] + 5000,\n        )\n    )\n    assert result.snapshot.move_no == 1 and result.snapshot.turn_no == 2\n    assert result.snapshot.occupied_cells[0].coordinate == move.coordinate\n"]]
+  },
+  "backend/tests/vote_runtime/test_legacy_initialization_guard.py": {
+    "before_sha256": "0f3477176fa058531046f297000cbfcf4ca99e17a1b4fdbaa665c8dd8f72be32",
+    "after_sha256": "81aa230f11d142b6c86ac5982d92428a6d5775f5f833223fec46c09a9379ee6a",
+    "edits": [[167,168,"    assert VOTE_MUTATION.version == 10\n"]]
+  },
+  "backend/tests/vote_runtime/test_redis_vote_adapter.py": {
+    "before_sha256": "70584649fccade2fbe234ef18fdcc384c441a765451e14648c87989dd3953a03",
+    "after_sha256": "6734f320d508224df545f0e410e77f6413f09f4dd5d9da0ee2ac5e20a47a966d",
+    "edits": [[258,259,"    assert VOTE_MUTATION.version == 10\n"]]
+  }
+}
