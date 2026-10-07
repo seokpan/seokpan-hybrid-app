@@ -1,0 +1,144 @@
+name: Owned Lua rejection regression
+on:
+  push:
+    branches: [fix/b-vote-rejection-atomicity-20261007]
+    paths: [.github/workflows/vote-rejection-temporary.yml]
+permissions:
+  contents: write
+concurrency:
+  group: b-vote-rejection-20261007
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: ${{ github.repository == 'seokpan/seokpan-hybrid-app' && github.actor == 'tjung03' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
+      PYTHONNOUSERSITE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      TARGET_BRANCH: fix/b-vote-rejection-atomicity-20261007
+      BASE_SHA: bdaa9dfa0a09e5d8efb1714ccf62860315b1346e
+      REDIS_SOURCE_SHA: d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Apply only reviewed byte changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 5b101cca70fd10cadd8052c84cfaffc6ad3487f4
+          mkdir -p "$RUNNER_TEMP/vote-report"
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          data=json.loads(Path('.github/maintenance/vote-rejection-input.json').read_text())
+          expected={'backend/src/seokpan/persistence/redis/vote_scripts.py','backend/tests/integration/test_departure_redis_lua.py','backend/tests/vote_runtime/test_legacy_initialization_guard.py','backend/tests/vote_runtime/test_redis_vote_adapter.py'}
+          assert set(data)==expected
+          prepared={}
+          for name,change in data.items():
+              path=Path(name);raw=path.read_bytes()
+              assert hashlib.sha256(raw).hexdigest()==change['before_sha256'],name
+              lines=raw.decode().splitlines(keepends=True);end=len(lines)
+              for first,last,text in reversed(change['edits']):
+                  assert 0<=first<=last<=end,name
+                  lines[first:last]=text.splitlines(keepends=True);end=first
+              output=''.join(lines).encode()
+              assert hashlib.sha256(output).hexdigest()==change['after_sha256'],name
+              prepared[path]=output
+          for path,output in prepared.items():path.write_bytes(output)
+          report=Path(os.environ['RUNNER_TEMP'])/'vote-report'
+          (report/'reviewed-identities.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Prepare pinned Python and the existing isolated Lua fixture binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/uv-tool"
+          "$RUNNER_TEMP/uv-tool/bin/pip" install --disable-pip-version-check uv==0.12.5
+          "$RUNNER_TEMP/uv-tool/bin/uv" python install 3.13.15
+          echo "$RUNNER_TEMP/uv-tool/bin" >> "$GITHUB_PATH"
+          (cd backend && "$RUNNER_TEMP/uv-tool/bin/uv" sync --locked)
+          git init "$RUNNER_TEMP/redis-source"
+          git -C "$RUNNER_TEMP/redis-source" remote add origin https://github.com/redis/redis.git
+          git -C "$RUNNER_TEMP/redis-source" fetch --depth=1 origin "$REDIS_SOURCE_SHA"
+          git -C "$RUNNER_TEMP/redis-source" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/redis-source" rev-parse HEAD)" = "$REDIS_SOURCE_SHA"
+          make -C "$RUNNER_TEMP/redis-source" -j2 MALLOC=libc BUILD_TLS=no OPT=-O2 redis-server 2>&1 | tee "$RUNNER_TEMP/vote-report/redis-build.log"
+          "$RUNNER_TEMP/redis-source/src/redis-server" --version | tee "$RUNNER_TEMP/vote-report/redis-version.txt"
+          printf '%s\n' "$REDIS_SOURCE_SHA" > "$RUNNER_TEMP/vote-report/redis-source.txt"
+      - name: Require original Lua board mutation and corrected rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file=backend/src/seokpan/persistence/redis/vote_scripts.py
+          cp "$source_file" "$RUNNER_TEMP/vote-fixed.py"
+          trap 'cp "$RUNNER_TEMP/vote-fixed.py" "$source_file"' EXIT
+          git show "$BASE_SHA:$source_file" > "$source_file"
+          set +e
+          (cd backend && SEOKPAN_REDIS_TEST_SERVER="$RUNNER_TEMP/redis-source/src/redis-server" uv run --no-sync pytest tests/integration/test_departure_redis_lua.py --junitxml="$RUNNER_TEMP/vote-report/before.xml" -q) > "$RUNNER_TEMP/vote-report/before.log" 2>&1
+          before_status=$?
+          set -e
+          test "$before_status" -eq 1
+          cp "$RUNNER_TEMP/vote-fixed.py" "$source_file"
+          trap - EXIT
+          python3 - <<'PY'
+          import os,xml.etree.ElementTree as ET
+          from pathlib import Path
+          tree=ET.parse(Path(os.environ['RUNNER_TEMP'])/'vote-report/before.xml')
+          cases=tree.findall('.//testcase');failed=[c for c in cases if c.find('failure') is not None]
+          assert len(cases)==5 and len(failed)==2
+          assert not tree.findall('.//error') and not tree.findall('.//skipped')
+          assert all('rejected_next_deadline' in c.get('name','') for c in failed)
+          assert all('rejected continuation must not mutate the board' in ''.join(c.find('failure').itertext()) for c in failed)
+          PY
+          (cd backend && SEOKPAN_REDIS_TEST_SERVER="$RUNNER_TEMP/redis-source/src/redis-server" uv run --no-sync pytest tests/integration/test_departure_redis_lua.py --junitxml="$RUNNER_TEMP/vote-report/after.xml" -q) 2>&1 | tee "$RUNNER_TEMP/vote-report/after.log"
+      - name: Full unchanged Backend CI policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd backend
+          uv run --python 3.13.15 --no-project python scripts/verify_ci.py --run-id "vote-${GITHUB_RUN_ID}" --uv "$(command -v uv)" 2>&1 | tee "$RUNNER_TEMP/vote-report/verify-ci.log"
+      - name: Publish only checked feature branch files and remove temporary inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess,shutil
+          from pathlib import Path
+          report=Path(os.environ['RUNNER_TEMP'])/'vote-report'
+          data=json.loads((report/'reviewed-identities.json').read_text())
+          for name,change in data.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==change['after_sha256'],name
+              target=report/'files'/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(name,target)
+          subprocess.run(['git','add','--',*data],check=True)
+          subprocess.run(['git','rm','.github/maintenance/vote-rejection-input.json','.github/workflows/vote-rejection-temporary.yml'],check=True)
+          actual=set(subprocess.check_output(['git','diff','--cached','--name-only',os.environ['BASE_SHA']],text=True).splitlines())
+          assert actual==set(data),actual
+          (report/'changes.patch').write_bytes(subprocess.check_output(['git','diff','--cached',os.environ['BASE_SHA']]))
+          PY
+          git diff --cached --check
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)" = "$GITHUB_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --author='tjung03 <73955817+tjung03@users.noreply.github.com>' -m 'fix: validate vote continuation before mutating the board hash'
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          git rev-parse HEAD > "$RUNNER_TEMP/vote-report/published-commit.txt"
+      - name: Preserve scope and reports
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vote-report"
+          if test -d "test-results/vote-${GITHUB_RUN_ID}"; then cp -a "test-results/vote-${GITHUB_RUN_ID}" "$RUNNER_TEMP/vote-report/reports"; fi
+          if test -d "backend/test-results/vote-${GITHUB_RUN_ID}"; then cp -a "backend/test-results/vote-${GITHUB_RUN_ID}" "$RUNNER_TEMP/vote-report/backend-reports"; fi
+          printf '%s\n' 'Owned, empty, loopback Redis 7.2.4 subprocess only. Historical fixture engine, not the selected Valkey target. No Cloud, TLS, operational credentials or cluster changes. Default CI excludes the opt-in real Lua suite.' > "$RUNNER_TEMP/vote-report/SCOPE.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: vote-rejection-verification-${{ github.run_id }}
+          path: ${{ runner.temp }}/vote-report
+          retention-days: 14
+          if-no-files-found: error
