@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = 02657f33842927706085039c6309d482ba4a48b9
+          test "$(git rev-parse HEAD^)" = 7dd26070dcde11516b3b74bbd3dd50ce6015849c
           test "$(git ls-remote origin refs/heads/fix/b-vote-rejection-atomicity-20261007 | cut -f1)" = "$ORIGINAL"
           test -z "$(git ls-remote origin refs/heads/$CANDIDATE)"
           git worktree add --detach "$RUNNER_TEMP/candidate" "$ORIGINAL"
@@ -55,11 +55,11 @@ jobs:
           report=pathlib.Path(os.environ['RUNNER_TEMP'])/'null-review'
           root=ET.parse(report/'before.xml').getroot();cases=list(root.iter('testcase'))
           failed=[case for case in cases if case.find('failure') is not None]
-          assert len(cases)==9 and len(failed)==2
+          assert len(cases)==9 and len(failed)==1
           assert not list(root.iter('error')) and not list(root.iter('skipped'))
-          assert all('[None]' in case.attrib['name'] for case in failed)
-          assert all('REDIS_PROVIDER_UNAVAILABLE' in ''.join(case.itertext()) for case in failed)
-          print('Expected two null handling failures, seven passing cases: verified')
+          assert failed[0].attrib['name']=='test_real_lua_rejected_pass_deadline_preserves_state_and_retry[None]'
+          assert 'REDIS_PROVIDER_UNAVAILABLE' in ''.join(failed[0].itertext())
+          print('Observed close_turn null error: one expected FAIL; eight PASS including existing Apply command-level null rejection')
           PY
       - name: Apply only reviewed correction and retain red-green results
         shell: bash
