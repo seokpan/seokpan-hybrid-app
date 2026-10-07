@@ -1,0 +1,105 @@
+name: Realtime subscription cancellation verification
+on:
+  push:
+    branches: [audit/b-realtime-subscribe-cancel-20261007]
+    paths: [.github/workflows/realtime-subscribe-cancel-audit.yml]
+permissions:
+  contents: write
+concurrency:
+  group: realtime-subscribe-cancel-20261007
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: ${{ github.repository == 'seokpan/seokpan-hybrid-app' && github.actor == 'tjung03' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BASE: bdaa9dfa0a09e5d8efb1714ccf62860315b1346e
+      TARGET: fix/b-realtime-subscribe-cancel-20261007
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Prepare isolated checkout and exact toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 5accbd47ea3f09a208bfe8c6ec6f7497be9c75c4
+          test -z "$(git ls-remote origin refs/heads/$TARGET)"
+          git worktree add --detach "$RUNNER_TEMP/candidate" "$BASE"
+          mkdir "$RUNNER_TEMP/realtime-review"
+          cp backend/tests/unit/test_realtime_subscription_startup.py "$RUNNER_TEMP/candidate/backend/tests/unit/"
+          python3 -m pip install --quiet --target "$RUNNER_TEMP/pinned-uv" uv==0.12.5
+          "$RUNNER_TEMP/pinned-uv/bin/uv" python install 3.13.15
+          cd "$RUNNER_TEMP/candidate/backend"
+          "$RUNNER_TEMP/pinned-uv/bin/uv" sync --frozen
+      - name: Require the four original cleanup failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/candidate/backend"
+          set +e
+          "$RUNNER_TEMP/pinned-uv/bin/uv" run --frozen pytest tests/unit/test_realtime_subscription_startup.py -q --junitxml="$RUNNER_TEMP/realtime-review/before.xml" > "$RUNNER_TEMP/realtime-review/before.log" 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 1
+          python3 - <<'PY'
+          import os,pathlib,xml.etree.ElementTree as ET
+          root=ET.parse(pathlib.Path(os.environ['RUNNER_TEMP'])/'realtime-review/before.xml').getroot()
+          cases=list(root.iter('testcase')); failures=list(root.iter('failure'))
+          assert len(cases)==4 and len(failures)==4
+          assert not list(root.iter('error')) and not list(root.iter('skipped'))
+          assert all('cancelled setup must close untransferred PubSub' in ''.join(f.itertext()) for f in failures)
+          print('Lobby/Room cancellation during subscribe/version: four cleanup failures reproduced')
+          PY
+      - name: Apply bounded correction and create exact clean source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/candidate"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          path=Path('backend/src/seokpan/persistence/redis/realtime_adapter.py')
+          assert hashlib.sha256(path.read_bytes()).hexdigest()=='696578736d5769300e7d82bba9bd5d738d13d0d50f3344490778da6c6bed3298'
+          old='        except (RedisError, RealtimeUnavailable):\n            await pubsub.aclose()  # type: ignore[no-untyped-call]\n            raise RealtimeUnavailable() from None\n'
+          new='        except asyncio.CancelledError:\n            # Ownership has not moved to _RedisRealtimeSubscription yet.\n            await pubsub.aclose()  # type: ignore[no-untyped-call]\n            raise\n'+old
+          text=path.read_text();assert text.count(old)==1;path.write_text(text.replace(old,new))
+          assert hashlib.sha256(path.read_bytes()).hexdigest()=='1ca607823d7aa9190879aa96888e5dcf2da52983cb29149145bbf8658d71a72e'
+          test=Path('backend/tests/unit/test_realtime_subscription_startup.py')
+          assert hashlib.sha256(test.read_bytes()).hexdigest()=='386407af0accd75fda75f4477cb1a4a08562d559bc8793cefdf5e738c3080f10'
+          PY
+          git add backend/src/seokpan/persistence/redis/realtime_adapter.py backend/tests/unit/test_realtime_subscription_startup.py
+          test "$(git diff --cached --name-only | wc -l)" -eq 2
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --author='tjung03 <73955817+tjung03@users.noreply.github.com>' -m 'fix: close PubSub when subscription setup is cancelled before ownership transfer'
+          test -z "$(git status --porcelain)"
+      - name: Verify scoped regression and full existing Backend policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          UV="$RUNNER_TEMP/pinned-uv/bin/uv"
+          cd "$RUNNER_TEMP/candidate/backend"
+          "$UV" run --frozen pytest tests/unit/test_realtime_subscription_startup.py -q --junitxml="$RUNNER_TEMP/realtime-review/after.xml" > "$RUNNER_TEMP/realtime-review/after.log" 2>&1
+          "$UV" run --frozen python -c 'from pathlib import Path; from scripts.verify_ci import check_report; import sys; check_report(Path(sys.argv[1]), "junit")' "$RUNNER_TEMP/realtime-review/after.xml"
+          cd ..
+          PYTHON=$("$UV" python find 3.13.15)
+          "$PYTHON" backend/scripts/verify_ci.py --run-id "realtime-${GITHUB_RUN_ID}" --uv "$UV" > "$RUNNER_TEMP/realtime-review/backend.log" 2>&1
+          git diff --exit-code
+          git bundle create "$RUNNER_TEMP/realtime-review/source.bundle" HEAD
+          git diff "$BASE" HEAD > "$RUNNER_TEMP/realtime-review/changes.patch"
+          git rev-parse HEAD > "$RUNNER_TEMP/realtime-review/source-sha.txt"
+          cp -r test-results "$RUNNER_TEMP/realtime-review/"
+          test -z "$(git ls-remote origin refs/heads/$TARGET)"
+          git push origin "HEAD:refs/heads/$TARGET"
+          printf '%s\n' 'Two-file source correction only; synthetic PubSub cancellation, no live Redis/Valkey/cluster or main merge.' > "$RUNNER_TEMP/realtime-review/SCOPE.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: realtime-subscribe-cancel-${{ github.run_id }}
+          path: ${{ runner.temp }}/realtime-review/
+          if-no-files-found: error
+          retention-days: 30
