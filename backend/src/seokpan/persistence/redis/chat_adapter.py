@@ -157,8 +157,13 @@ class RedisChatAdapter:
         pubsub = self._client.pubsub()
         try:
             await pubsub.subscribe(RedisKeyspace.chat_channel(_scope_key(scope)))
+        except asyncio.CancelledError:
+            with suppress(RedisError):
+                await pubsub.aclose()  # type: ignore[no-untyped-call]
+            raise
         except RedisError:
-            await pubsub.aclose()  # type: ignore[no-untyped-call]
+            with suppress(RedisError):
+                await pubsub.aclose()  # type: ignore[no-untyped-call]
             raise ChatDeliveryUnavailable("CHAT_DELIVERY_UNAVAILABLE") from None
         return _RedisChatSubscription(pubsub, max_queue_size=self._queue_limit)
 
