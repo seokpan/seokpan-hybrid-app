@@ -423,6 +423,12 @@ if operation == 'apply_resolution' then
   if not move_resolution and not joint_loss_resolution then
     return rejection('RESOLUTION_MISMATCH')
   end
+  -- Reject invalid continuation before changing the authoritative board hash.
+  -- Lua execution isolation does not undo writes after an application rejection.
+  if payload.next_game_status == 'ACTIVE'
+      and (payload.next_deadline_ms == nil or payload.next_deadline_ms <= game.deadline_ms) then
+    return rejection('INVALID_NEXT_DEADLINE')
+  end
   if move_resolution then
     local selected = resolution.selected_coordinate
     local valid = false
@@ -442,9 +448,6 @@ if operation == 'apply_resolution' then
   game.end_reason = payload.next_end_reason
   game.candidates = {}
   if game.game_status == 'ACTIVE' then
-    if payload.next_deadline_ms == nil or payload.next_deadline_ms <= game.deadline_ms then
-      return rejection('INVALID_NEXT_DEADLINE')
-    end
     game.turn_no = game.turn_no + 1
     game.current_team = game.current_team == 'BLACK' and 'WHITE' or 'BLACK'
     game.deadline_ms = payload.next_deadline_ms
@@ -500,7 +503,7 @@ return rejection('VOTE_OPERATION_INVALID')
 
 VOTE_MUTATION = VersionedLuaScript(
     name="vote-runtime-mutation",
-    version=9,
+    version=10,
     source=_COMMON + _MUTATION,
 )
 
