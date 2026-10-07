@@ -39,7 +39,12 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/backend-audit-bootstrap"
           "$RUNNER_TEMP/backend-audit-bootstrap/bin/pip" install --disable-pip-version-check uv==0.12.5
           UV="$RUNNER_TEMP/backend-audit-bootstrap/bin/uv"
-          test "$("$UV" --version)" = 'uv 0.12.5'
+          "$UV" --version | tee "$RUNNER_TEMP/backend-audit-report/uv-version.txt"
+          python3 - "$RUNNER_TEMP/backend-audit-report/uv-version.txt" <<'PY'
+          import sys
+          from pathlib import Path
+          assert Path(sys.argv[1]).read_text().split()[:2] == ['uv','0.12.5']
+          PY
           "$UV" python install 3.13.15
           PYTHON="$($UV python find --managed-python 3.13.15)"
           "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,13,15),sys.version'
