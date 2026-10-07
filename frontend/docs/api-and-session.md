@@ -157,7 +157,7 @@ npm run api:check -- --schema <공유 작업 디렉터리>/openapi.json
 
 - Node 24.19.0 / npm 12.0.2: `npm run verify`의 명세 비교·TypeScript·**72 Test / 5 Files PASS**·Build PASS. 새 의존성/Lock 변경 없음. 화면 교체 전 Scaffold Test 2개를 실제 인증·목록 Test로 교체했다.
 - 화면 Test: Guest/Member·가입/로그아웃·입력·중복 클릭·자격 거부·중복 가입·응답 유실·CSRF·StrictMode·이전 화면의 늦은 응답·서버 오류·목록 검증·텍스트 렌더링. 테스트용 fetch 응답이며 실제 DB/Redis 성공으로 표시하지 않는다.
-- 실제 Windows Codex 내장 브라우저에서 Vite → Uvicorn 개발 서버를 사용했다. 로그인 화면·좁은 폭의 세로 카드 배치와 회원가입 입력 표시, **Guest 진입 → 빈 로비 → 새로고침 후 같은 Guest → 로그아웃**을 확인했다. 유효 Cookie만 남은 페이지 재시작 뒤 CSRF가 필요한 실제 로그아웃까지 통과했다.
+- 실제 Windows 브라우저에서 Vite → Uvicorn 개발 서버를 사용했다. 로그인 화면·좁은 폭의 세로 카드 배치와 회원가입 입력 표시, **Guest 진입 → 빈 로비 → 새로고침 후 같은 Guest → 로그아웃**을 확인했다. 유효 Cookie만 남은 페이지 재시작 뒤 CSRF가 필요한 실제 로그아웃까지 통과했다.
 - 이번 브라우저 확인은 수동 조작 Smoke Test다. 고정 Browser Revision의 자동 E2E, 실제 Member 가입/로그인 Browser Test, 데스크톱/모바일 전체 접근성·반응형 검증은 아직 남아 있다. Component Test를 이 결과로 확대하지 않는다.
 - 종료 후 임시 탭을 닫고 서버 두 개를 중단했다. 8000/5173 Listening 없음 확인. 실제 Provider·VM·Cluster·원격 기록은 변경하지 않았다.
 
