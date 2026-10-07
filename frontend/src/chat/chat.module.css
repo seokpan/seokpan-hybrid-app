@@ -98,9 +98,12 @@
   margin: 0.4rem 0 0;
   overflow-wrap: anywhere;
 }
-.feedback[data-empty="true"] {
+.roomPanel .feedback[data-empty="true"] {
   min-height: 0;
   margin: 0;
+}
+.roomPanel .newMessages[data-empty="true"] {
+  display: none;
 }
 .panel > h2,
 .panel > .hint,

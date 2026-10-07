@@ -40,7 +40,11 @@ export function HoverPanel({
       onBlurCapture={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) {
           setFocused(false);
-          setPinned(false);
+          // Native dialogs move focus outside this card. Keep their opener
+          // visible so closing the dialog can restore its keyboard focus.
+          const modal =
+            event.relatedTarget instanceof Element && event.relatedTarget.closest("dialog[open]");
+          setPinned(!!modal);
           setDismissed(false);
         }
       }}

@@ -34,6 +34,18 @@ describe("expandable workspace panels", () => {
     fireEvent.blur(trigger, { relatedTarget: action });
     fireEvent.focus(action, { relatedTarget: trigger });
     expect(trigger).toHaveAttribute("aria-expanded", "true");
+    const modal = render(
+      <dialog open>
+        <button>확인 모달 취소</button>
+      </dialog>,
+    );
+    const cancel = screen.getByRole("button", { name: "확인 모달 취소" });
+    fireEvent.blur(action, { relatedTarget: cancel });
+    fireEvent.mouseLeave(trigger.parentElement!);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    fireEvent.focus(action, { relatedTarget: cancel });
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    modal.unmount();
     fireEvent.blur(action, { relatedTarget: screen.getByRole("button", { name: "패널 밖" }) });
     expect(trigger).toHaveAttribute("aria-expanded", "false");
   });

@@ -1074,7 +1074,30 @@
     height: 100%;
   }
   .boardViewport .boardFrame.fitBoard {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    width: 100%;
+    height: 100%;
+  }
+  .fitBoard .boardTools {
+    display: flex;
+  }
+  .fitBoard .boardScroll {
+    display: flex;
+    align-items: flex-start;
+    justify-content: safe center;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: auto;
+    container-type: size;
+  }
+  .fitBoard .board {
+    flex: 0 0 auto;
     width: min(100cqw, 100cqh, 320px);
+  }
+  .fitBoard .expanded {
+    min-width: 600px;
   }
 }
 

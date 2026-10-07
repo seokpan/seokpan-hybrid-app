@@ -178,8 +178,8 @@ function ConnectedChat({
           ))
         )}
       </div>
-      {unread && (
-        <div className={styles.newMessages}>
+      <div className={styles.newMessages} data-empty={!unread}>
+        {unread && (
           <button
             type="button"
             disabled={!active}
@@ -191,8 +191,8 @@ function ConnectedChat({
           >
             새 메시지 보기 ↓
           </button>
-        </div>
-      )}
+        )}
+      </div>
       <form
         onSubmit={(event) => {
           event.preventDefault();
