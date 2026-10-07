@@ -1,0 +1,62 @@
+name: Backend source and owned Lua regression
+on:
+  pull_request:
+    branches: [main]
+    paths: ['backend/**', '.github/workflows/backend-source-validation.yml', 'docs/HYBRID_LUA_REGRESSION.md']
+  push:
+    branches: [main]
+    paths: ['backend/**', '.github/workflows/backend-source-validation.yml', 'docs/HYBRID_LUA_REGRESSION.md']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: backend-source-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prepare pinned tools and existing isolated regression engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --target "$RUNNER_TEMP/pinned-uv" uv==0.12.5
+          "$RUNNER_TEMP/pinned-uv/bin/uv" python install 3.13.15
+          git init -q "$RUNNER_TEMP/redis-source"
+          git -C "$RUNNER_TEMP/redis-source" fetch -q --depth=1 https://github.com/redis/redis.git d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7
+          git -C "$RUNNER_TEMP/redis-source" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/redis-source" rev-parse HEAD)" = d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7
+          make -C "$RUNNER_TEMP/redis-source" -j2 MALLOC=libc BUILD_TLS=no redis-server > "$RUNNER_TEMP/redis-build.log" 2>&1
+      - name: Existing full Backend CI policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset SEOKPAN_REDIS_TEST_SERVER
+          UV="$RUNNER_TEMP/pinned-uv/bin/uv"
+          PYTHON=$("$UV" python find 3.13.15)
+          "$PYTHON" backend/scripts/verify_ci.py --run-id "source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --uv "$UV"
+      - name: Owned real Lua regression before release acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          UV="$RUNNER_TEMP/pinned-uv/bin/uv"
+          REPORT="$GITHUB_WORKSPACE/test-results/source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export SEOKPAN_REDIS_TEST_SERVER="$RUNNER_TEMP/redis-source/src/redis-server"
+          cd backend
+          "$UV" run --frozen pytest tests/integration/test_departure_redis_lua.py -q --junitxml="$REPORT/lua-junit.xml"
+          "$UV" run --frozen python -c 'from pathlib import Path; from scripts.verify_ci import check_report; import sys; check_report(Path(sys.argv[1]), "junit")' "$REPORT/lua-junit.xml"
+          git diff --exit-code
+          git rev-parse HEAD > "$REPORT/source-sha.txt"
+          "$SEOKPAN_REDIS_TEST_SERVER" --version > "$REPORT/regression-engine.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: backend-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 30

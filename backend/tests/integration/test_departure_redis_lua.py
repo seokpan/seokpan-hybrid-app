@@ -275,3 +275,100 @@ async def test_real_lua_closed_turn_move_converges_before_departure_and_is_redis
         DueTurn(r, g, 2),
     )
     assert closed.snapshot.turn_status is TurnStatus.RESOLVING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline_offset", [-1000, 0, None])
+async def test_real_lua_rejected_next_deadline_preserves_board_and_retry(server, deadline_offset):
+    _rooms, votes, r, g, black, _white = await setup(server)
+    state = await votes.get(r)
+    await votes.cast_vote(
+        CastRuntimeVote(r, "vote", g, 1, black, Coordinate.parse("A1"), state.state_version)
+    )
+    raw = json.loads(await server.get(RedisKeyspace.room_game(r)))
+    seconds, micros = await server.time()
+    raw["deadline_ms"] = seconds * 1000 + micros // 1000 - 1
+    await server.set(RedisKeyspace.room_game(r), json.dumps(raw))
+    state = await votes.get(r)
+    await votes.close_turn(
+        CloseRuntimeTurn(r, "close", g, 1, state.state_version, raw["deadline_ms"] + 5000)
+    )
+    state = await votes.get(r)
+    leased = await votes.acquire_resolver(
+        AcquireRuntimeResolver(r, "lease", g, 1, "normal", state.state_version)
+    )
+    move = AppliedMove(1, Stone.BLACK, Coordinate.parse("A1"))
+    resolution = TurnResolution(
+        g,
+        1,
+        Stone.BLACK,
+        TurnResultKind.MOVE_APPLIED,
+        TurnStatus.MOVE_APPLIED,
+        move.coordinate,
+        move,
+        None,
+    )
+    before = await votes.get(r)
+    before_game = await server.get(RedisKeyspace.room_game(r))
+    with pytest.raises(VoteRuleViolation, match="INVALID_NEXT_DEADLINE"):
+        await votes.apply_resolution(
+            ApplyRuntimeResolution(
+                r,
+                "apply-invalid",
+                g,
+                1,
+                "normal",
+                resolution,
+                leased.snapshot.state_version,
+                True,
+                None if deadline_offset is None else raw["deadline_ms"] + deadline_offset,
+            )
+        )
+    assert await votes.get(r) == before, "rejected continuation must not mutate the board"
+    assert await server.get(RedisKeyspace.room_game(r)) == before_game
+    result = await votes.apply_resolution(
+        ApplyRuntimeResolution(
+            r,
+            "apply-valid",
+            g,
+            1,
+            "normal",
+            resolution,
+            leased.snapshot.state_version,
+            True,
+            raw["deadline_ms"] + 5000,
+        )
+    )
+    assert result.snapshot.move_no == 1 and result.snapshot.turn_no == 2
+    assert result.snapshot.occupied_cells[0].coordinate == move.coordinate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline_offset", [-1000, 0, None])
+async def test_real_lua_rejected_pass_deadline_preserves_state_and_retry(server, deadline_offset):
+    _rooms, votes, r, g, _black, _white = await setup(server)
+    raw = json.loads(await server.get(RedisKeyspace.room_game(r)))
+    seconds, micros = await server.time()
+    raw["deadline_ms"] = seconds * 1000 + micros // 1000 - 1
+    await server.set(RedisKeyspace.room_game(r), json.dumps(raw))
+    before = await votes.get(r)
+    before_game = await server.get(RedisKeyspace.room_game(r))
+    with pytest.raises(VoteRuleViolation, match="INVALID_NEXT_DEADLINE"):
+        await votes.close_turn(
+            CloseRuntimeTurn(
+                r,
+                "pass-invalid",
+                g,
+                1,
+                before.state_version,
+                None if deadline_offset is None else raw["deadline_ms"] + deadline_offset,
+            )
+        )
+    assert await votes.get(r) == before, "rejected pass must not mutate runtime state"
+    assert await server.get(RedisKeyspace.room_game(r)) == before_game
+    result = await votes.close_turn(
+        CloseRuntimeTurn(r, "pass-valid", g, 1, before.state_version, raw["deadline_ms"] + 5000)
+    )
+    assert result.snapshot.turn_no == 2
+    assert result.snapshot.move_no == 0
+    assert result.snapshot.turn_status is TurnStatus.VOTING

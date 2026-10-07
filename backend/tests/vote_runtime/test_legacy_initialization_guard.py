@@ -165,7 +165,7 @@ async def test_redis_initialization_declares_guard_keys_after_predecessor(previo
 
 def test_lua_guard_precedes_cache_expiry_and_does_not_decode_partial_proof():
     source = VOTE_MUTATION.source
-    assert VOTE_MUTATION.version == 9
+    assert VOTE_MUTATION.version == 11
     assert source.index("CAPTURED_START_REQUIRED") < source.index("local expired")
     assert source.index("CAPTURED_START_REQUIRED") < source.index("if cached then")
     assert "redis.call('EXISTS', KEYS[key_count - 1], KEYS[key_count])" in source
