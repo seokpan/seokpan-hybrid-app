@@ -221,6 +221,10 @@ class RedisRealtimeEventAdapter:
             await pubsub.subscribe(RedisKeyspace.realtime_channel(scope))
             version = await self._read_version(scope)
             update_version(version)
+        except asyncio.CancelledError:
+            # Ownership has not moved to _RedisRealtimeSubscription yet.
+            await pubsub.aclose()  # type: ignore[no-untyped-call]
+            raise
         except (RedisError, RealtimeUnavailable):
             await pubsub.aclose()  # type: ignore[no-untyped-call]
             raise RealtimeUnavailable() from None
