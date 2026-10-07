@@ -1,0 +1,84 @@
+name: B pinned Backend source audit
+on:
+  push:
+    branches: [audit/b-backend-locked-20261007]
+    paths: [.github/workflows/b-backend-audit-temporary.yml]
+permissions:
+  contents: read
+concurrency:
+  group: b-backend-source-audit-20261007
+  cancel-in-progress: false
+jobs:
+  source-checks:
+    if: ${{ github.repository == 'seokpan/seokpan-hybrid-app' && github.event.repository.private == false && github.actor == 'tjung03' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      REVIEWED_SOURCE: bdaa9dfa0a09e5d8efb1714ccf62860315b1346e
+      AWS_EC2_METADATA_DISABLED: 'true'
+      PYTHONNOUSERSITE: '1'
+      UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/backend-audit-python
+      UV_CACHE_DIR: ${{ runner.temp }}/backend-audit-cache
+      UV_NO_PROGRESS: '1'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: bdaa9dfa0a09e5d8efb1714ccf62860315b1346e
+          persist-credentials: false
+      - name: Check source identity and prepare isolated pinned tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/backend-audit-report"
+          git rev-parse HEAD > "$RUNNER_TEMP/backend-audit-report/source-sha.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/backend-audit-report/source-tree.txt"
+          sha256sum backend/pyproject.toml backend/uv.lock > "$RUNNER_TEMP/backend-audit-report/source-lock-hashes.txt"
+          python3 -m venv "$RUNNER_TEMP/backend-audit-bootstrap"
+          "$RUNNER_TEMP/backend-audit-bootstrap/bin/pip" install --disable-pip-version-check uv==0.12.5
+          UV="$RUNNER_TEMP/backend-audit-bootstrap/bin/uv"
+          test "$("$UV" --version)" = 'uv 0.12.5'
+          "$UV" python install 3.13.15
+          PYTHON="$($UV python find --managed-python 3.13.15)"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,13,15),sys.version'
+          printf 'AUDIT_UV=%s\nAUDIT_PYTHON=%s\n' "$UV" "$PYTHON" >> "$GITHUB_ENV"
+      - name: Existing Backend offline verification entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$AUDIT_PYTHON" backend/scripts/verify_ci.py \
+            --uv "$AUDIT_UV" --run-id "source-audit-${GITHUB_RUN_ID}" \
+            2>&1 | tee "$RUNNER_TEMP/backend-audit-report/verify-ci.log"
+      - name: Preserve exact reports and source invariants
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/backend-audit-report"
+          if test -d "test-results/source-audit-${GITHUB_RUN_ID}/backend"; then
+            cp -R "test-results/source-audit-${GITHUB_RUN_ID}/backend" "$RUNNER_TEMP/backend-audit-report/backend"
+          fi
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=no)"
+          python3 - <<'PY'
+          import json,os,platform,subprocess
+          from pathlib import Path
+          output=Path(os.environ['RUNNER_TEMP'])/'backend-audit-report'
+          source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          record={'workflow_trigger_sha':os.environ['GITHUB_SHA'],
+                  'reviewed_source_sha':source,'run_id':os.environ['GITHUB_RUN_ID'],
+                  'scope':'Existing Backend offline source/type/test/coverage entrypoint; no deployment or target Data credentials',
+                  'runner':platform.platform(),'tracked_source_changed':False,
+                  'runtime_acceptance':'NOT_RUN','image_build':'NOT_RUN',
+                  'db_valkey_cloud_connection':'NOT_RUN'}
+          (output/'audit-scope.json').write_text(json.dumps(record,indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: backend-source-audit-${{ github.run_id }}
+          path: ${{ runner.temp }}/backend-audit-report
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
