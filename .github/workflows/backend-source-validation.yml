@@ -2,10 +2,10 @@ name: Backend source and owned Lua regression
 on:
   pull_request:
     branches: [main]
-    paths: ['backend/**', '.github/workflows/backend-source-validation.yml']
+    paths: ['backend/**', '.github/workflows/backend-source-validation.yml', 'docs/HYBRID_LUA_REGRESSION.md']
   push:
-    branches: [main, fix/b-vote-rejection-atomicity-20261007]
-    paths: ['backend/**', '.github/workflows/backend-source-validation.yml']
+    branches: [main]
+    paths: ['backend/**', '.github/workflows/backend-source-validation.yml', 'docs/HYBRID_LUA_REGRESSION.md']
   workflow_dispatch:
 permissions:
   contents: read
@@ -36,6 +36,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset SEOKPAN_REDIS_TEST_SERVER
           UV="$RUNNER_TEMP/pinned-uv/bin/uv"
           PYTHON=$("$UV" python find 3.13.15)
           "$PYTHON" backend/scripts/verify_ci.py --run-id "source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --uv "$UV"
