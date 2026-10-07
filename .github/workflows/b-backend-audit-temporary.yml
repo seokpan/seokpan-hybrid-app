@@ -17,8 +17,6 @@ jobs:
       REVIEWED_SOURCE: bdaa9dfa0a09e5d8efb1714ccf62860315b1346e
       AWS_EC2_METADATA_DISABLED: 'true'
       PYTHONNOUSERSITE: '1'
-      UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/backend-audit-python
-      UV_CACHE_DIR: ${{ runner.temp }}/backend-audit-cache
       UV_NO_PROGRESS: '1'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -29,6 +27,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export UV_PYTHON_INSTALL_DIR="$RUNNER_TEMP/backend-audit-python"
+          export UV_CACHE_DIR="$RUNNER_TEMP/backend-audit-cache"
+          printf 'UV_PYTHON_INSTALL_DIR=%s\nUV_CACHE_DIR=%s\n' "$UV_PYTHON_INSTALL_DIR" "$UV_CACHE_DIR" >> "$GITHUB_ENV"
           test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
           test -z "$(git status --porcelain)"
           mkdir -p "$RUNNER_TEMP/backend-audit-report"
