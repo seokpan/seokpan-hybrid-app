@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import cast
 from uuid import uuid4
@@ -221,6 +222,12 @@ class RedisRealtimeEventAdapter:
             await pubsub.subscribe(RedisKeyspace.realtime_channel(scope))
             version = await self._read_version(scope)
             update_version(version)
+        except asyncio.CancelledError:
+            # Ownership has not moved to _RedisRealtimeSubscription yet.
+            # Cleanup RedisError must not replace the cancellation being handled.
+            with suppress(RedisError):
+                await pubsub.aclose()  # type: ignore[no-untyped-call]
+            raise
         except (RedisError, RealtimeUnavailable):
             await pubsub.aclose()  # type: ignore[no-untyped-call]
             raise RealtimeUnavailable() from None
