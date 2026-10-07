@@ -1,0 +1,114 @@
+name: Null deadline review candidate
+on:
+  push:
+    branches: [audit/b-null-review-20261007]
+    paths: [.github/workflows/null-review-candidate.yml]
+permissions:
+  contents: write
+concurrency:
+  group: null-review-candidate-20261007
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: ${{ github.repository == 'seokpan/seokpan-hybrid-app' && github.actor == 'tjung03' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ORIGINAL: 971c4a56590200cfa75bab8ba8f23d968d85edd3
+      CANDIDATE: candidate/b-null-review-20261007
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Check scope and prepare pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 02657f33842927706085039c6309d482ba4a48b9
+          test "$(git ls-remote origin refs/heads/fix/b-vote-rejection-atomicity-20261007 | cut -f1)" = "$ORIGINAL"
+          test -z "$(git ls-remote origin refs/heads/$CANDIDATE)"
+          git worktree add --detach "$RUNNER_TEMP/candidate" "$ORIGINAL"
+          mkdir "$RUNNER_TEMP/null-review"
+          python3 -m pip install --quiet --target "$RUNNER_TEMP/pinned-uv" uv==0.12.5
+          "$RUNNER_TEMP/pinned-uv/bin/uv" python install 3.13.15
+          git init -q "$RUNNER_TEMP/redis-source"
+          git -C "$RUNNER_TEMP/redis-source" fetch -q --depth=1 https://github.com/redis/redis.git d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7
+          git -C "$RUNNER_TEMP/redis-source" checkout -q --detach FETCH_HEAD
+          make -C "$RUNNER_TEMP/redis-source" -j2 MALLOC=libc BUILD_TLS=no redis-server > "$RUNNER_TEMP/null-review/redis-build.log" 2>&1
+      - name: Reproduce original null handling with new regression cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/maintenance/null-review.py tests "$RUNNER_TEMP/candidate"
+          UV="$RUNNER_TEMP/pinned-uv/bin/uv"
+          export SEOKPAN_REDIS_TEST_SERVER="$RUNNER_TEMP/redis-source/src/redis-server"
+          cd "$RUNNER_TEMP/candidate/backend"
+          "$UV" sync --frozen
+          set +e
+          "$UV" run --frozen pytest tests/integration/test_departure_redis_lua.py -q --junitxml="$RUNNER_TEMP/null-review/before.xml" > "$RUNNER_TEMP/null-review/before.log" 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 1
+          python3 - <<'PY'
+          import os,pathlib,xml.etree.ElementTree as ET
+          report=pathlib.Path(os.environ['RUNNER_TEMP'])/'null-review'
+          root=ET.parse(report/'before.xml').getroot();cases=list(root.iter('testcase'))
+          failed=[case for case in cases if case.find('failure') is not None]
+          assert len(cases)==9 and len(failed)==2
+          assert not list(root.iter('error')) and not list(root.iter('skipped'))
+          assert all('[None]' in case.attrib['name'] for case in failed)
+          assert all('REDIS_PROVIDER_UNAVAILABLE' in ''.join(case.itertext()) for case in failed)
+          print('Expected two null handling failures, seven passing cases: verified')
+          PY
+      - name: Apply only reviewed correction and retain red-green results
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/maintenance/null-review.py fix "$RUNNER_TEMP/candidate" > "$RUNNER_TEMP/null-review/output-hashes.json"
+          UV="$RUNNER_TEMP/pinned-uv/bin/uv"
+          export SEOKPAN_REDIS_TEST_SERVER="$RUNNER_TEMP/redis-source/src/redis-server"
+          cd "$RUNNER_TEMP/candidate/backend"
+          "$UV" run --frozen pytest tests/integration/test_departure_redis_lua.py -q --junitxml="$RUNNER_TEMP/null-review/after.xml" > "$RUNNER_TEMP/null-review/after.log" 2>&1
+          "$UV" run --frozen python -c 'from pathlib import Path; from scripts.verify_ci import check_report; import sys; check_report(Path(sys.argv[1]), "junit")' "$RUNNER_TEMP/null-review/after.xml"
+      - name: Commit the six review files and verify the exact clean candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/candidate"
+          git add backend/src/seokpan/persistence/redis/vote_scripts.py backend/tests/integration/test_departure_redis_lua.py backend/tests/vote_runtime/test_legacy_initialization_guard.py backend/tests/vote_runtime/test_redis_vote_adapter.py .github/workflows/backend-source-validation.yml docs/HYBRID_LUA_REGRESSION.md
+          test "$(git diff --cached --name-only | wc -l)" -eq 6
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --author='tjung03 <73955817+tjung03@users.noreply.github.com>' -m 'fix: reject null next deadlines and continuously run owned Lua regressions'
+          test -z "$(git status --porcelain)"
+          UV="$RUNNER_TEMP/pinned-uv/bin/uv"
+          PYTHON=$("$UV" python find 3.13.15)
+          "$PYTHON" backend/scripts/verify_ci.py --run-id "null-${GITHUB_RUN_ID}" --uv "$UV" > "$RUNNER_TEMP/null-review/backend.log" 2>&1
+          export SEOKPAN_REDIS_TEST_SERVER="$RUNNER_TEMP/redis-source/src/redis-server"
+          (cd backend && "$UV" run --frozen pytest tests/integration/test_departure_redis_lua.py -q --junitxml="$RUNNER_TEMP/null-review/final.xml")
+          git diff --exit-code
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,shutil,subprocess
+          report=pathlib.Path(os.environ['RUNNER_TEMP'])/'null-review'
+          hashes=json.loads((report/'output-hashes.json').read_text())
+          for name,digest in hashes.items():
+              path=pathlib.Path(name);assert hashlib.sha256(path.read_bytes()).hexdigest()==digest,name
+              target=report/'files'/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(path,target)
+          (report/'changes.patch').write_bytes(subprocess.check_output(['git','diff',os.environ['ORIGINAL'],'HEAD']))
+          (report/'candidate-sha.txt').write_bytes(subprocess.check_output(['git','rev-parse','HEAD']))
+          shutil.copytree('test-results',report/'test-results')
+          PY
+          test "$(git ls-remote origin refs/heads/fix/b-vote-rejection-atomicity-20261007 | cut -f1)" = "$ORIGINAL"
+          test -z "$(git ls-remote origin refs/heads/$CANDIDATE)"
+          git push origin "HEAD:refs/heads/$CANDIDATE"
+          git bundle create "$RUNNER_TEMP/null-review/candidate.bundle" HEAD
+          printf '%s\n' 'Candidate only; PR18 branch not changed; no main merge, Image or service operation.' > "$RUNNER_TEMP/null-review/SCOPE.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: null-review-${{ github.run_id }}
+          path: ${{ runner.temp }}/null-review/
+          if-no-files-found: error
+          retention-days: 30
