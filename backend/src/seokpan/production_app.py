@@ -181,23 +181,24 @@ def create_production_app(settings: Settings) -> FastAPI:
                     _run_background_services(services, readiness, recovery_probe=probe_recovery),
                     name="seokpan-production-runner",
                 )
-                await asyncio.sleep(0)
-                if runner.done():
-                    await runner
-                shell.state.runtime_application = runtime
-
-                def stop_after_runner_exit(task: asyncio.Task[None]) -> None:
-                    if task.cancelled():
-                        return
-                    readiness.mark_not_ready()
-                    _LOGGER.critical(
-                        "Production background runner ended; requesting process shutdown",
-                        extra={"event": "production.runner.process_shutdown_requested"},
-                    )
-                    _request_process_shutdown()
-
-                runner.add_done_callback(stop_after_runner_exit)
+                # Own the runner before the first cancellation point in startup.
                 try:
+                    await asyncio.sleep(0)
+                    if runner.done():
+                        await runner
+                    shell.state.runtime_application = runtime
+
+                    def stop_after_runner_exit(task: asyncio.Task[None]) -> None:
+                        if task.cancelled():
+                            return
+                        readiness.mark_not_ready()
+                        _LOGGER.critical(
+                            "Production background runner ended; requesting process shutdown",
+                            extra={"event": "production.runner.process_shutdown_requested"},
+                        )
+                        _request_process_shutdown()
+
+                    runner.add_done_callback(stop_after_runner_exit)
                     yield
                 finally:
                     readiness.mark_not_ready()
