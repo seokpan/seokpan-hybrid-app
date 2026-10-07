@@ -229,7 +229,8 @@ class RedisRealtimeEventAdapter:
                 await pubsub.aclose()  # type: ignore[no-untyped-call]
             raise
         except (RedisError, RealtimeUnavailable):
-            await pubsub.aclose()  # type: ignore[no-untyped-call]
+            with suppress(RedisError):
+                await pubsub.aclose()  # type: ignore[no-untyped-call]
             raise RealtimeUnavailable() from None
         return _RedisRealtimeSubscription(
             pubsub,
