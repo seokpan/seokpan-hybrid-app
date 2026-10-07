@@ -149,8 +149,8 @@ def _create_browser_app(resolved: Settings, clock: MillisecondClock | None, orig
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with base_lifespan(app):
             task = asyncio.create_task(runner.run(), name="seokpan-development-runner")
-            await asyncio.sleep(0)
             try:
+                await asyncio.sleep(0)
                 if not runner.available():
                     raise RuntimeError("DEVELOPMENT_STARTUP_FAILED")
                 yield
