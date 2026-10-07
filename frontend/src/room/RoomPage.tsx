@@ -108,25 +108,54 @@ function ConnectedRoom({ stream, active }: { stream: SnapshotStream<RoomView>; a
   };
   return (
     <section className={`${styles.card} ${styles.roomCard}`} aria-labelledby="room-title">
-      <div className={styles.sectionHeading}>
-        <div>
-          <p className="eyebrow">ROOM</p>
-          <h1 id="room-title">{room?.name ?? "대기방"}</h1>
+      <div className={styles.roomToolbar}>
+        <div className={styles.roomIdentity}>
+          <span className={styles.roomLabel}>ROOM</span>
+          <h1 id="room-title" title={room?.name ?? "대기방"}>
+            {room?.name ?? "대기방"}
+          </h1>
         </div>
-        <button
-          className={styles.secondaryButton}
-          disabled={!canLeave}
-          aria-describedby={leaveImpact ? "room-leave-impact" : undefined}
-          onClick={() => void auth.run(leaveRoom, "방에서 나왔습니다.")}
-        >
-          방 나가기
-        </button>
+        {room && (
+          <p className={styles.roomMeta}>
+            {room.visibility === "PRIVATE" ? "비공개" : "공개"} · {room.participants.length} /{" "}
+            {room.max_participants}명 · 최소 Ready {room.minimum_ready}명
+          </p>
+        )}
+        <div className={styles.roomActions}>
+          {leaveImpact && (
+            <details
+              className={styles.roomLeaveHelp}
+              onMouseEnter={(event) => {
+                event.currentTarget.open = true;
+              }}
+              onMouseLeave={(event) => {
+                if (!event.currentTarget.contains(document.activeElement))
+                  event.currentTarget.open = false;
+              }}
+              onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget))
+                  event.currentTarget.open = false;
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.currentTarget.open = false;
+                }
+              }}
+            >
+              <summary>나가기 전 안내</summary>
+              <p id="room-leave-impact">{leaveImpact}</p>
+            </details>
+          )}
+          <button
+            className={styles.secondaryButton}
+            disabled={!canLeave}
+            aria-describedby={leaveImpact ? "room-leave-impact" : undefined}
+            onClick={() => void auth.run(leaveRoom, "방에서 나왔습니다.")}
+          >
+            방 나가기
+          </button>
+        </div>
       </div>
-      {leaveImpact && (
-        <p id="room-leave-impact" className={styles.muted}>
-          {leaveImpact}
-        </p>
-      )}
       {view.phase !== "ready" && view.phase !== "syncing" && (
         <div role="status" className={styles.notice}>
           {view.message || "최신 방 상태를 확인하고 있습니다. 잠시 기다려 주세요."}
@@ -154,10 +183,6 @@ function ConnectedRoom({ stream, active }: { stream: SnapshotStream<RoomView>; a
       )}
       {room && (
         <>
-          <p>
-            {room.visibility === "PRIVATE" ? "비공개" : "공개"} · {room.participants.length} /{" "}
-            {room.max_participants}명 · 최소 Ready {room.minimum_ready}명
-          </p>
           {(room.status === "WAITING" || view.snapshot?.game) && (
             <GamePanel
               game={view.snapshot?.game ?? null}
@@ -167,6 +192,15 @@ function ConnectedRoom({ stream, active }: { stream: SnapshotStream<RoomView>; a
               ready={view.phase === "ready"}
               refresh={stream.refresh}
               voteSeconds={room.vote_seconds}
+              waitingSummary={
+                <>
+                  Ready {readyPlayers.length}명 / 최소 {room.minimum_ready}명
+                  <span className={gameStyles.readinessSummary}>
+                    {enoughReady && blackReady && whiteReady ? "시작 조건 충족" : "참가자 준비 중"}
+                    {me?.ready ? " · 나는 Ready" : " · 나는 미준비"}
+                  </span>
+                </>
+              }
               chat={
                 <ChatPanel
                   roomId={room.room_id}

@@ -19,7 +19,10 @@ export function ChatPanel({
   const title = roomId === null ? "로비 채팅" : "방 채팅";
   if (!enabled || auth.view.phase !== "ready")
     return (
-      <section className={styles.panel} aria-label={title}>
+      <section
+        className={`${styles.panel} ${roomId !== null ? styles.roomPanel : ""}`}
+        aria-label={title}
+      >
         <h2>{title}</h2>
         <p role="status">접속 상태 확인 후 채팅을 이용할 수 있습니다.</p>
       </section>
@@ -125,9 +128,12 @@ function ConnectedChat({
     }
   }
   return (
-    <section className={styles.panel} aria-label={title}>
+    <section
+      className={`${styles.panel} ${roomId !== null ? styles.roomPanel : ""}`}
+      aria-label={title}
+    >
       <h2>{title}</h2>
-      <p className={styles.hint}>{view.notice}</p>
+      {view.notice && <p className={styles.hint}>{view.notice}</p>}
       {view.phase === "closed" && (
         <button
           type="button"
@@ -172,8 +178,8 @@ function ConnectedChat({
           ))
         )}
       </div>
-      <div className={styles.newMessages}>
-        {unread && (
+      {unread && (
+        <div className={styles.newMessages}>
           <button
             type="button"
             disabled={!active}
@@ -185,8 +191,8 @@ function ConnectedChat({
           >
             새 메시지 보기 ↓
           </button>
-        )}
-      </div>
+        </div>
+      )}
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -229,8 +235,13 @@ function ConnectedChat({
         <p id={`${id}-help`} className={styles.hint}>
           {length}/200자 · Enter 전송 · Shift+Enter 줄바꿈
         </p>
-        <p id={`${id}-result`} className={styles.feedback} role="status">
-          {feedback || (length > 200 ? "200자 이내로 입력해 주세요." : "\u00a0")}
+        <p
+          id={`${id}-result`}
+          className={styles.feedback}
+          role="status"
+          data-empty={!feedback && length <= 200}
+        >
+          {feedback || (length > 200 ? "200자 이내로 입력해 주세요." : "")}
         </p>
       </form>
     </section>
