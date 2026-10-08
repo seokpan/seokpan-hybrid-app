@@ -3,7 +3,8 @@
 """hybrid-gitops Image Promotion pure planner (hybrid-app #15).
 
 입력(image-metadata.json 내용 + 로컬 checkout 파일 내용)만으로 선택 환경의 FE/BE Image
-Digest 변경안을 계산한다. 네트워크, git, PAT, 파일 쓰기를 하지 않는다.
+Digest 변경안을 계산한다. 네트워크, git, PAT, 파일 쓰기를 하지 않는다. checkout 파일은 symlink/hard link를 따라가지 않는
+safe_fs 로만 읽는다.
 
 변경 범위는 `images[name=seokpan-backend|seokpan-frontend]` 항목의 `digest` 값 한 줄과,
 lab Backend 갱신 시 held Migration Job의 Image digest 한 줄뿐이다. 그 밖의 바이트(주석,
@@ -23,6 +24,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import safe_fs  # noqa: E402
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -466,9 +471,12 @@ def _read_checkout(gitops_dir: Path, env: str, components: Iterable[str]) -> dic
     if env == "cloud":
         return files
     for rel in sorted(allowed_paths(env, components)):
-        target = gitops_dir / rel
-        if target.is_file():
-            files[rel] = target.read_bytes().decode("utf-8")  # keep line endings as-is
+        try:
+            text = safe_fs.read_text(gitops_dir, rel)  # no symlink / hard link is followed; line endings kept
+        except safe_fs.SafeFsError as exc:
+            raise PlanError(exc.code, exc.message)
+        if text is not None:
+            files[rel] = text
     return files
 
 

@@ -8,6 +8,7 @@ import ast
 import copy
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -382,6 +383,62 @@ class PurityTests(unittest.TestCase):
         snapshot = copy.deepcopy(meta)
         target.plan_promotion(meta, "recovery", ["backend"], {target.ENV_KUSTOMIZATION["recovery"]: RECOVERY_KUST})
         self.assertEqual(meta, snapshot)
+
+
+class CheckoutReadSafetyTests(unittest.TestCase):
+    """_read_checkout must never follow a symlink or hard link out of the checkout."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.root = self.base / "gitops"
+        self.rel = target.ENV_KUSTOMIZATION["recovery"]
+        (self.root / self.rel).parent.mkdir(parents=True)
+        self.outside = self.base / "outside.yaml"
+        self.outside.write_text(RECOVERY_KUST + "# OUTSIDE-MARKER\n", encoding="utf-8")
+
+    def read(self):
+        return target._read_checkout(self.root, "recovery", ["backend", "frontend"])
+
+    def test_regular_file_is_read_with_line_endings_intact(self) -> None:
+        with open(self.root / self.rel, "w", encoding="utf-8", newline="") as f:
+            f.write(RECOVERY_KUST.replace("\n", "\r\n"))
+        self.assertEqual(self.read()[self.rel], RECOVERY_KUST.replace("\n", "\r\n"))
+
+    def test_missing_file_is_simply_absent(self) -> None:
+        self.assertEqual(self.read(), {})
+
+    def test_symlinked_file_is_rejected_without_reading_it(self) -> None:
+        (self.root / self.rel).symlink_to(self.outside)
+        with self.assertRaises(target.PlanError) as ctx:
+            self.read()
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+        self.assertNotIn("OUTSIDE-MARKER", str(ctx.exception))
+
+    def test_symlinked_directory_hard_link_and_cli_exit_code(self) -> None:
+        ext = self.base / "ext"
+        (ext / "recovery").mkdir(parents=True)
+        (ext / "recovery" / "kustomization.yaml").write_text(RECOVERY_KUST, encoding="utf-8")
+        (self.root / self.rel).parent.rmdir()
+        (self.root / self.rel).parent.symlink_to(ext / "recovery")
+        with self.assertRaises(target.PlanError) as ctx:
+            self.read()
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+        (self.root / self.rel).parent.unlink()
+        (self.root / self.rel).parent.mkdir()
+        os.link(self.outside, self.root / self.rel)
+        with self.assertRaises(target.PlanError) as ctx:
+            self.read()
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+        meta = self.base / "meta.json"
+        meta.write_text(json.dumps(metadata()), encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = target.main(["--env", "recovery", "--metadata", str(meta), "--gitops-dir", str(self.root)])
+        self.assertEqual(rc, 2)
+        self.assertIn("UNSAFE_PATH", err.getvalue())
+        self.assertNotIn("OUTSIDE-MARKER", out.getvalue() + err.getvalue())
 
 
 class CliTests(unittest.TestCase):
