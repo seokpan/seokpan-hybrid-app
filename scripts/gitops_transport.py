@@ -8,9 +8,12 @@
   (D2 Build 3 에서 Push/PR 동작이 검증된 경로)
 
 안전 규칙: 대상 저장소는 allowlist 한 곳, 요청은 api.github.com 으로만 보내고 redirect 를 따라가지
-않는다. Branch 는 `promotion/` 만 생성/삭제하고 PR base 는 main 뿐이다. force push 와 main
-Push 는 없다. 토큰은 Authorization 헤더와 git 하위 프로세스 환경 변수로만 쓰이며 오류 문자열은
-마스킹한다. 이 모듈은 Jenkinsfile 에 연결되지 않았다(후속).
+않는다. Branch 는 `promotion/` 만 생성/삭제하고 PR base 는 main 뿐이다. main Push 와 일반 force
+push 는 없다. Push 는 "원격에 그 Branch 가 없을 때만 생성"하는 create-only 조건
+(`--force-with-lease=<ref>:`, 기대값 빈 문자열)이라 이미 있는 Branch 는 fast-forward 여도 갱신하지
+않는다. 인증정보를 공급하기 전에 `origin` 의 실제 push URL(`pushurl`/`pushInsteadOf` 적용 후)이
+승인된 하나의 URL 인지 확인한다. 토큰은 Authorization 헤더와 git 하위 프로세스 환경 변수로만 쓰이며
+오류 문자열은 마스킹한다. 이 모듈은 Jenkinsfile 에 연결되지 않았다(후속).
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import gitops_writer as writer  # noqa: E402
 
 API_BASE = "https://api.github.com"
 ALLOWED_REPOS = ("seokpan/seokpan-hybrid-gitops",)
+DEFAULT_PUSH_URL = "https://github.com/seokpan/seokpan-hybrid-gitops.git"
 USER_ENV = "GITOPS_GITHUB_USER"
 TOKEN_ENV = "GITOPS_GITHUB_TOKEN"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -94,6 +98,15 @@ def _check_branch(branch: str, *, promotion_only: bool) -> None:
         raise writer.TransportError(f"only {writer.BRANCH_PREFIX}* branches may be created or deleted")
 
 
+def _check_push_url(url: str) -> str:
+    """The approved GitHub URL, or (for tests only) an absolute local path. Never another remote."""
+    if url == DEFAULT_PUSH_URL:
+        return url
+    if isinstance(url, str) and url.startswith("/") and not url.startswith("//") and "://" not in url:
+        return url
+    raise writer.TransportError("push_url must be the approved GitHub URL (a local path is allowed for tests only)")
+
+
 def _check_path(path: str) -> str:
     pure = PurePosixPath(path) if isinstance(path, str) else None
     if (
@@ -119,6 +132,7 @@ class GitHubApiTransport(writer.GitHubTransport):
         git_bin: str = "git",
         author_name: str = "seokpan-jenkins",
         author_email: str = "seokpan-jenkins@users.noreply.github.com",
+        push_url: str = DEFAULT_PUSH_URL,
     ) -> None:
         if repo not in ALLOWED_REPOS:
             raise writer.TransportError("repository is not in the allowlist")
@@ -132,6 +146,7 @@ class GitHubApiTransport(writer.GitHubTransport):
         self._http = http or urllib_http
         self._git_bin = git_bin
         self._author = (author_name, author_email)
+        self._push_url = _check_push_url(push_url)
 
     def __repr__(self) -> str:  # never include the credential
         return f"GitHubApiTransport(repo={self._repo!r})"
@@ -288,10 +303,24 @@ class GitHubApiTransport(writer.GitHubTransport):
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise writer.TransportError(f"git {args[0]} could not run: {type(exc).__name__}")
         if proc.returncode != 0:
+            name = next((a for a in args if not a.startswith("-") and "=" not in a), args[0])
             raise writer.TransportError(
-                f"git {args[0]} failed rc={proc.returncode}: {writer.redact(proc.stderr.strip())[:300]}"
+                f"git {name} failed rc={proc.returncode}: {writer.redact(proc.stderr.strip())[:300]}"
             )
         return proc.stdout
+
+    def _verify_push_target(self) -> None:
+        """Before any credential is used: `origin` must push to exactly the approved URL.
+
+        `git remote get-url --push --all` applies `remote.<name>.pushurl`, multiple push URLs and
+        `url.<base>.insteadOf` / `pushInsteadOf`, i.e. the destinations `git push origin` would use.
+        URLs are not echoed because they may embed credentials.
+        """
+        urls = [u.strip() for u in self._git(["remote", "get-url", "--push", "--all", "origin"]).splitlines() if u.strip()]
+        if urls != [self._push_url]:
+            raise writer.TransportError(
+                f"push target of 'origin' is not the single approved repository URL ({len(urls)} push URL(s) configured)"
+            )
 
     def push_commit(self, branch: str, base_sha: str, files: Mapping[str, str], message: str) -> str:
         _check_branch(branch, promotion_only=True)
@@ -305,6 +334,7 @@ class GitHubApiTransport(writer.GitHubTransport):
         if not isinstance(message, str) or not message.strip():
             raise writer.TransportError("commit message is empty")
 
+        self._verify_push_target()  # fail before touching the checkout or using the credential
         if self._git(["rev-parse", "HEAD"]).strip() != base_sha:
             raise writer.TransportError("checkout HEAD differs from the base sha")
         if self._git(["status", "--porcelain"]).strip():
@@ -332,5 +362,15 @@ class GitHubApiTransport(writer.GitHubTransport):
             askpass = make_askpass(Path(directory))
             env = dict(os.environ)
             env.update({"GIT_ASKPASS": str(askpass), USER_ENV: self._user, TOKEN_ENV: self._token})
-            self._git(["push", "--no-verify", "origin", f"HEAD:refs/heads/{branch}"], env=env)
+            self._verify_push_target()  # re-check right before the credential is supplied
+            # create-only: the empty expected value means "the remote ref must not exist", so an
+            # existing branch is never updated, even by a fast-forward.
+            self._git(
+                [
+                    "-c", "credential.helper=", "push", "--no-verify",
+                    f"--force-with-lease=refs/heads/{branch}:",
+                    "origin", f"HEAD:refs/heads/{branch}",
+                ],
+                env=env,
+            )
         return commit_sha

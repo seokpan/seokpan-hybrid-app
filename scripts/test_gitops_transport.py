@@ -46,8 +46,8 @@ class FakeHttp:
         return status, (body if isinstance(body, bytes) else json.dumps(body).encode())
 
 
-def make(http, checkout: Path = Path("/nonexistent")) -> target.GitHubApiTransport:
-    return target.GitHubApiTransport(REPO, USER, TOKEN, checkout, http=http)
+def make(http, checkout: Path = Path("/nonexistent"), **kw) -> target.GitHubApiTransport:
+    return target.GitHubApiTransport(REPO, USER, TOKEN, checkout, http=http, **kw)
 
 
 def pull_item(number=1, head=BRANCH, state="open", merged_at=None) -> dict:
@@ -65,6 +65,18 @@ class ConstructionTests(unittest.TestCase):
             target.GitHubApiTransport(REPO, "", TOKEN, Path("."))
         with self.assertRaises(writer.TransportError):
             target.GitHubApiTransport(REPO, USER, "", Path("."))
+
+    def test_push_url_is_the_approved_github_url_or_a_test_local_path_only(self) -> None:
+        self.assertEqual(target.DEFAULT_PUSH_URL, "https://github.com/seokpan/seokpan-hybrid-gitops.git")
+        make(FakeHttp(), push_url=target.DEFAULT_PUSH_URL)
+        make(FakeHttp(), push_url="/tmp/some/origin.git")
+        for bad in ("https://evil.example/seokpan/seokpan-hybrid-gitops.git",
+                    "https://github.com/seokpan/other.git",
+                    "git@github.com:seokpan/seokpan-hybrid-gitops.git",
+                    "ssh://git@github.com/seokpan/seokpan-hybrid-gitops.git",
+                    "file:///tmp/origin.git", "//host/share", "relative/path", ""):
+            with self.subTest(url=bad), self.assertRaises(writer.TransportError):
+                make(FakeHttp(), push_url=bad)
 
     def test_repr_never_contains_the_credential(self) -> None:
         self.assertNotIn(TOKEN, repr(make(FakeHttp())))
@@ -214,8 +226,12 @@ class SecurityTests(unittest.TestCase):
     def test_source_does_not_use_requests_or_force(self) -> None:
         src = (Path(__file__).resolve().parent / "gitops_transport.py").read_text(encoding="utf-8")
         self.assertNotIn("import requests", src)
-        self.assertNotIn("--force", src)
         self.assertNotIn("+HEAD", src)
+        # only the exact create-only lease is allowed; no bare --force / --force-with-lease
+        import re
+        tokens = re.findall(r"--force[\w-]*(?:=\S*)?", src)
+        self.assertTrue(tokens)
+        self.assertTrue(all(t.startswith("--force-with-lease=") for t in tokens), tokens)  # never a bare --force
 
 
 def git(*args, cwd, check=True):
@@ -250,7 +266,7 @@ class GitFixture:
         self.tmp.cleanup()
 
     def transport(self, http=None) -> target.GitHubApiTransport:
-        return make(http or FakeHttp(), self.checkout)
+        return make(http or FakeHttp(), self.checkout, push_url=str(self.bare))
 
     def bare_has(self, branch: str) -> bool:
         return subprocess.run(
@@ -299,6 +315,8 @@ class GitTests(GitFixture, unittest.TestCase):
         cmd, env = push[0]
         self.assertEqual(cmd[-2:], ["origin", f"HEAD:refs/heads/{BRANCH}"])
         self.assertNotIn("--force", cmd)
+        self.assertIn(f"--force-with-lease=refs/heads/{BRANCH}:", cmd)  # create-only
+        self.assertEqual(cmd[:3], ["git", "-c", "credential.helper="])
         self.assertEqual(env[target.TOKEN_ENV], TOKEN)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertTrue(env["GIT_ASKPASS"].endswith("git-askpass.sh"))
@@ -333,6 +351,78 @@ class GitTests(GitFixture, unittest.TestCase):
             self.transport().push_commit(BRANCH, self.base, {"releases/rel-y.json": "{}\n"}, "second")
         self.assertNotIn(TOKEN, str(ctx.exception))
         self.assertEqual(git("rev-parse", BRANCH, cwd=self.bare), first)
+
+    def test_existing_branch_at_the_base_commit_is_not_fast_forwarded(self) -> None:
+        # plain `git push` would succeed here and move the ref; the create-only lease must not
+        git("push", "origin", f"{self.base}:refs/heads/{BRANCH}", cwd=self.checkout)
+        before = git("rev-parse", BRANCH, cwd=self.bare)
+        with self.assertRaises(writer.TransportError) as ctx:
+            self.transport().push_commit(BRANCH, self.base, {"releases/rel-x.json": "{}\n"}, "m")
+        self.assertNotIn(TOKEN, str(ctx.exception))
+        self.assertEqual(git("rev-parse", BRANCH, cwd=self.bare), before)
+        self.assertEqual(before, self.base)
+
+    def test_branch_created_by_a_concurrent_run_after_the_check_is_not_updated(self) -> None:
+        real_run = subprocess.run
+        other = {}
+
+        def race(cmd, *a, **kw):
+            if "push" in cmd and not other:
+                other["sha"] = self.base
+                real_run(["git", "push", "origin", f"{self.base}:refs/heads/{BRANCH}"],
+                         cwd=self.checkout, check=True, capture_output=True)  # rival wins the race
+            return real_run(cmd, *a, **kw)
+
+        with mock.patch.object(target.subprocess, "run", race):
+            with self.assertRaises(writer.TransportError):
+                self.transport().push_commit(BRANCH, self.base, {"releases/rel-x.json": "{}\n"}, "m")
+        self.assertEqual(git("rev-parse", BRANCH, cwd=self.bare), other["sha"])
+
+    def assert_blocked_before_credentials(self, *config) -> None:
+        for key, value in config:
+            git("config", "--add", key, value, cwd=self.checkout)
+        calls: list = []
+        real_run = subprocess.run
+
+        def spy(cmd, *a, **kw):
+            calls.append((list(cmd), dict(kw.get("env") or {})))
+            return real_run(cmd, *a, **kw)
+
+        head_before = git("rev-parse", "HEAD", cwd=self.checkout)
+        with mock.patch.object(target.subprocess, "run", spy):
+            with self.assertRaises(writer.TransportError) as ctx:
+                self.transport().push_commit(BRANCH, self.base, {"releases/rel-x.json": "{}\n"}, "m")
+        self.assertNotIn(TOKEN, str(ctx.exception))
+        self.assertFalse(any("push" in c[0] for c in calls))
+        self.assertFalse(any(target.TOKEN_ENV in c[1] for c in calls))
+        self.assertFalse(self.bare_has(BRANCH))
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.checkout), head_before)  # checkout untouched
+        self.assertEqual(git("branch", "--list", BRANCH, cwd=self.checkout), "")
+
+    def test_remote_origin_pushurl_pointing_elsewhere_is_blocked(self) -> None:
+        self.assert_blocked_before_credentials(("remote.origin.pushurl", "https://evil.example/o.git"))
+
+    def test_additional_push_urls_are_blocked(self) -> None:
+        # the approved URL plus a second destination: two push targets, not exactly one
+        self.assert_blocked_before_credentials(
+            ("remote.origin.pushurl", str(self.bare)), ("remote.origin.pushurl", "https://evil.example/o.git"))
+
+    def test_pushinsteadof_rewrite_is_blocked(self) -> None:
+        self.assert_blocked_before_credentials(("url.https://evil.example/.pushInsteadOf", str(self.bare.parent) + "/"))
+
+    def test_ssh_and_foreign_https_origin_are_blocked(self) -> None:
+        for url in ("git@github.com:seokpan/seokpan-hybrid-gitops.git", "https://github.com/seokpan/other.git",
+                    "https://evil.example/seokpan/seokpan-hybrid-gitops.git"):
+            with self.subTest(url=url):
+                git("remote", "set-url", "origin", url, cwd=self.checkout)
+                with self.assertRaises(writer.TransportError):
+                    self.transport().push_commit(BRANCH, self.base, {"releases/rel-x.json": "{}\n"}, "m")
+                self.assertFalse(self.bare_has(BRANCH))
+
+    def test_default_github_url_is_accepted_by_the_check_without_network(self) -> None:
+        git("remote", "set-url", "origin", target.DEFAULT_PUSH_URL, cwd=self.checkout)
+        tr = make(FakeHttp(), self.checkout)  # default push_url
+        tr._verify_push_target()  # must not raise, and must not touch the network
 
     def test_guards_on_branch_path_and_size(self) -> None:
         tr = self.transport()
@@ -399,7 +489,7 @@ class EndToEndTests(GitFixture, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.gh = FakeGitHub(self.bare)
-        self.tr = make(self.gh, self.checkout)
+        self.tr = make(self.gh, self.checkout, push_url=str(self.bare))
         files = {gitops_planner.ENV_KUSTOMIZATION["recovery"]: (self.checkout / gitops_planner.ENV_KUSTOMIZATION["recovery"]).read_bytes().decode("utf-8")}
         self.plan = gitops_planner.plan_promotion(wx.meta(), "recovery", ["backend", "frontend"], files)
 
@@ -457,7 +547,7 @@ class EndToEndTests(GitFixture, unittest.TestCase):
                 return 204, b""
             return original(method, url, headers, data)
 
-        self.tr = make(failing, self.checkout)
+        self.tr = make(failing, self.checkout, push_url=str(self.bare))
         with self.assertRaises(writer.WriterError) as ctx:
             self.run_writer()
         self.assertEqual(ctx.exception.code, "PROMOTION_PR_CREATE_FAILED")
