@@ -130,7 +130,45 @@ def allowed_write_paths(plan: gitops_planner.PlanResult, release_id: str) -> set
     return set(gitops_planner.allowed_paths(plan.env, plan.components)) | {release_path(release_id)}
 
 
-def build_pr_text(plan: gitops_planner.PlanResult, release_id: str, files: Sequence[str]) -> tuple:
+def _safe(value: object, limit: int = 80) -> str:
+    """One-line, credential-masked, length-limited text for values copied from metadata into a PR."""
+    text = "" if value is None else redact(value).replace("`", "'")
+    text = " ".join(text.split())[:limit]
+    return text or "미수신"
+
+
+def build_provenance_lines(plan: gitops_planner.PlanResult, metadata: Mapping) -> list:
+    """Show verification evidence that metadata already holds. Nothing here is newly verified."""
+    parsed = gitops_planner.parse_metadata(metadata)
+    registry = "ecr" if plan.env == "cloud" else "harbor"
+    lines = [
+        f"- 원본 Run: run_id `{_safe(metadata.get('run_id'))}` / Jenkins Build 번호 `{_safe(metadata.get('jenkins_build_number'))}`",
+        f"- 이 환경이 사용하는 Registry 값: {registry.upper()} (Registry Digest는 서로 같다고 가정하지 않음)",
+    ]
+    for name in plan.components:
+        raw = metadata["components"][name]
+        parts = []
+        for kind in ("harbor", "ecr"):
+            image = getattr(parsed.components[name], kind)
+            if image is not None:
+                parts.append(
+                    f"{kind.upper()} `{_safe(image.repository, 120)}` / `{image.digest}` / `{','.join(image.platforms)}`"
+                )
+        lines.append(f"- {name}: " + " | ".join(parts))
+        lines.append(
+            f"  - Scan: `{_safe(raw.get('scan'))}` / Health smoke: `{_safe(raw.get('health_smoke'))}` (metadata 기록값이며 Writer가 새로 검증한 결과가 아님)"
+        )
+    if any(c.path == gitops_planner.MIGRATION_PATH for c in plan.image_changes):
+        lines.append(
+            f"- lab Migration Job(`{gitops_planner.MIGRATION_PATH}`)은 held 상태입니다. Image Digest 한 줄만 lab Backend와 맞추며 "
+            "suspend/args/deadline/Secret/실행 여부는 변경하지 않고 실행하지 않습니다."
+        )
+    return lines
+
+
+def build_pr_text(
+    plan: gitops_planner.PlanResult, release_id: str, files: Sequence[str], metadata: Mapping
+) -> tuple:
     title = f"chore(promotion): {plan.env} image promotion {release_id}"
     changes = [
         f"  - {c.path} / {c.component}: `{c.old_digest}` -> `{c.new_digest}`" for c in plan.image_changes
@@ -144,6 +182,8 @@ def build_pr_text(plan: gitops_planner.PlanResult, release_id: str, files: Seque
             f"- App Source SHA: `{plan.app_sha}`",
             "- Image Digest 변경:",
             *changes,
+            "- Image 출처와 검증 근거(metadata 기록):",
+            *build_provenance_lines(plan, metadata),
             "- 변경 파일:",
             *[f"  - {path}" for path in files],
             f"- Release 후보 `{release_path(release_id)}`는 INCOMPLETE이며 미수신 값은 null / NOT RUN입니다.",
@@ -171,7 +211,37 @@ def _api(call, *args):
         raise WriterError("PROMOTION_API_ERROR", str(exc))
 
 
-def _check_candidate(plan: gitops_planner.PlanResult, release_id: str, candidate_text: str) -> None:
+def _check_images(plan: gitops_planner.PlanResult, metadata: Mapping, candidate: Mapping) -> None:
+    """Candidate, plan and metadata must describe the same Image Digests/platforms."""
+    try:
+        parsed = gitops_planner.parse_metadata(metadata)
+    except gitops_planner.PlanError as exc:
+        raise WriterError(exc.code, str(exc))
+    if parsed.app_sha != plan.app_sha:
+        raise WriterError("PLAN_METADATA_MISMATCH", "plan App SHA differs from the metadata App SHA")
+    expected = {
+        name: {
+            "ecr_digest": metadata["release_json_images"][name]["ecr_digest"],
+            "harbor_digest": metadata["release_json_images"][name]["harbor_digest"],
+            "platform": metadata["release_json_images"][name]["platform"],
+        }
+        for name in ("frontend", "backend")
+    }
+    if candidate.get("images") != expected:
+        raise WriterError("RELEASE_CANDIDATE_IMAGES_MISMATCH", "candidate images differ from the metadata Digest/platform")
+    registry = "ecr" if plan.env == "cloud" else "harbor"
+    for change in plan.image_changes:
+        image = getattr(parsed.components[change.component], registry)
+        if image is None or image.digest != change.new_digest:
+            raise WriterError(
+                "PLAN_METADATA_MISMATCH",
+                f"{change.component}: planned digest differs from the metadata {registry} digest",
+            )
+
+
+def _check_candidate(
+    plan: gitops_planner.PlanResult, metadata: Mapping, release_id: str, candidate_text: str
+) -> None:
     try:
         release_candidate.validate_release_id(release_id, plan.env, plan.app_sha)
     except release_candidate.ReleaseError as exc:
@@ -189,6 +259,7 @@ def _check_candidate(plan: gitops_planner.PlanResult, release_id: str, candidate
     source = candidate.get("source")
     if not isinstance(source, dict) or source.get("app_sha") != plan.app_sha:
         raise WriterError("RELEASE_CANDIDATE_INVALID", "candidate App SHA differs from the plan")
+    _check_images(plan, metadata, candidate)
 
 
 def _check_existing_promotions(transport: GitHubTransport, plan: gitops_planner.PlanResult, branch: str) -> None:
@@ -214,18 +285,24 @@ def _check_existing_promotions(transport: GitHubTransport, plan: gitops_planner.
 def write_promotion(
     transport: GitHubTransport,
     plan: gitops_planner.PlanResult,
+    metadata: Mapping,
     release_id: str,
     candidate_text: str,
     expected_base_sha: str,
     write: bool = False,
 ) -> WriteResult:
-    """Push the planned change as `promotion/<release-id>` and open a PR (only when `write=True`)."""
+    """Push the planned change as `promotion/<release-id>` and open a PR (only when `write=True`).
+
+    `metadata` is the image-metadata.json the plan and candidate were built from. The candidate's
+    Digest/platform and the plan's digests must match it, and its Run/Scan/Health values are shown
+    in the PR for the human reviewer.
+    """
     if plan.status == "NO_CHANGE":
         return WriteResult("NO_CHANGE", None, (), None, None, None, tuple(plan.notes) + ("PROMOTION_NO_CHANGE",))
     if not isinstance(expected_base_sha, str) or not SHA_RE.match(expected_base_sha):
         raise WriterError("BASE_SHA_INVALID", "expected_base_sha is not a 40-hex SHA")
 
-    _check_candidate(plan, release_id, candidate_text)
+    _check_candidate(plan, metadata, release_id, candidate_text)
     rel_path = release_path(release_id)
     files = dict(plan.new_files)
     if rel_path in files:
@@ -246,7 +323,7 @@ def write_promotion(
     _check_existing_promotions(transport, plan, branch)
 
     paths = tuple(sorted(files))
-    title, body = build_pr_text(plan, release_id, paths)
+    title, body = build_pr_text(plan, release_id, paths, metadata)
     if not write:
         return WriteResult("DRY_RUN", branch, paths, None, None, title, tuple(plan.notes))
 

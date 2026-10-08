@@ -83,15 +83,35 @@ class FakeTransport(target.GitHubTransport):
         return [c for c in self.calls if c[0] in ("push_commit", "create_pull_request", "delete_branch")]
 
 
+def meta(be: str = NEW_BE, fe: str = NEW_FE) -> dict:
+    """image-metadata.json with the provenance fields assemble_evidence() also emits."""
+    m = fx.metadata(be=be, fe=fe)
+    m["run_id"] = "run-0003"
+    m["jenkins_build_number"] = "3"
+    m["jenkins_build_url"] = "http://jenkins-controller.cicd.svc.cluster.local:8080/job/hybrid/job/image-pipeline/3/"
+    for name in ("backend", "frontend"):
+        m["components"][name]["scan"] = "PASS"
+        m["components"][name]["health_smoke"] = "PASS"
+    return m
+
+
 def make_plan(env: str = "recovery", be: str = NEW_BE, fe: str = NEW_FE) -> gitops_planner.PlanResult:
-    meta = fx.metadata(be=be, fe=fe)
     files = {gitops_planner.ENV_KUSTOMIZATION["recovery"]: fx.RECOVERY_KUST}
-    return gitops_planner.plan_promotion(meta, "recovery", ["backend", "frontend"], files)
+    return gitops_planner.plan_promotion(meta(be, fe), "recovery", ["backend", "frontend"], files)
 
 
-def make_candidate(rid: str = RID, env: str = "recovery") -> str:
-    meta = fx.metadata(be=NEW_BE, fe=NEW_FE)
-    return release_candidate.render_json(release_candidate.build_candidate(meta, env, rid))
+def make_lab_plan() -> gitops_planner.PlanResult:
+    files = {
+        gitops_planner.ENV_KUSTOMIZATION["lab"]: fx.LAB_KUST,
+        gitops_planner.MIGRATION_PATH: fx.MIGRATION,
+    }
+    return gitops_planner.plan_promotion(
+        meta(), "lab", ["backend", "frontend"], files, lab_mapping=fx.lab_mapping(NEW_BE, NEW_FE)
+    )
+
+
+def make_candidate(rid: str = RID, env: str = "recovery", metadata: Optional[dict] = None) -> str:
+    return release_candidate.render_json(release_candidate.build_candidate(metadata or meta(), env, rid))
 
 
 def pr(number: int, head: str, state: str = "open", merged: bool = False) -> target.PullRequestInfo:
@@ -100,7 +120,7 @@ def pr(number: int, head: str, state: str = "open", merged: bool = False) -> tar
 
 def run(tr: FakeTransport, write: bool = False, **overrides):
     kwargs = dict(
-        transport=tr, plan=make_plan(), release_id=RID, candidate_text=make_candidate(),
+        transport=tr, plan=make_plan(), metadata=meta(), release_id=RID, candidate_text=make_candidate(),
         expected_base_sha=BASE, write=write,
     )
     kwargs.update(overrides)
@@ -134,7 +154,7 @@ class HappyPathTests(unittest.TestCase):
         tr = FakeTransport()
         plan = make_plan()
         candidate = make_candidate()
-        target.write_promotion(tr, plan, RID, candidate, BASE, write=True)
+        target.write_promotion(tr, plan, meta(), RID, candidate, BASE, write=True)
         for path, text in plan.new_files.items():
             self.assertEqual(tr.pushed["files"][path], text)
         self.assertEqual(tr.pushed["files"][REL_PATH], candidate)
@@ -161,7 +181,7 @@ class HappyPathTests(unittest.TestCase):
             fx.metadata(), "recovery", ["backend", "frontend"],
             {gitops_planner.ENV_KUSTOMIZATION["recovery"]: fx.RECOVERY_KUST.replace(fx.OLD_BE, fx.H_BE).replace(fx.OLD_FE, fx.H_FE)},
         )
-        result = target.write_promotion(tr, same, RID, make_candidate(), BASE, write=True)
+        result = target.write_promotion(tr, same, meta(), RID, make_candidate(), BASE, write=True)
         self.assertEqual(result.status, "NO_CHANGE")
         self.assertIn("PROMOTION_NO_CHANGE", result.notes)
         self.assertEqual(tr.calls, [])
@@ -299,6 +319,92 @@ class MutationFailureTests(unittest.TestCase):
         self.assertNotIn(TOKEN, str(ctx.exception))
 
 
+class ConsistencyTests(unittest.TestCase):
+    def assert_blocked(self, code: str, **overrides) -> None:
+        tr = FakeTransport()
+        with self.assertRaises(target.WriterError) as ctx:
+            run(tr, write=True, **overrides)
+        self.assertEqual(ctx.exception.code, code)
+        self.assertEqual(tr.mutations(), [])
+        self.assertEqual(tr.calls, [])  # rejected before any remote read
+
+    def test_candidate_digests_differing_from_metadata_are_rejected(self) -> None:
+        other = meta(be="sha256:" + "7" * 64, fe="sha256:" + "8" * 64)
+        self.assert_blocked("RELEASE_CANDIDATE_IMAGES_MISMATCH", candidate_text=make_candidate(metadata=other))
+
+    def test_only_one_component_differing_is_rejected(self) -> None:
+        other = meta(fe="sha256:" + "8" * 64)
+        self.assert_blocked("RELEASE_CANDIDATE_IMAGES_MISMATCH", candidate_text=make_candidate(metadata=other))
+
+    def test_candidate_platform_differing_is_rejected(self) -> None:
+        tampered = make_candidate().replace("linux/amd64", "linux/arm64")
+        self.assert_blocked("RELEASE_CANDIDATE_IMAGES_MISMATCH", candidate_text=tampered)
+
+    def test_plan_built_from_other_digests_is_rejected(self) -> None:
+        stale_plan = make_plan(be="sha256:" + "7" * 64, fe="sha256:" + "8" * 64)
+        self.assert_blocked("PLAN_METADATA_MISMATCH", plan=stale_plan)
+
+    def test_plan_app_sha_must_match_metadata(self) -> None:
+        other = meta()
+        other["commit_sha_full"] = "f" * 40
+        other["commit_sha_12"] = "f" * 12
+        self.assert_blocked("PLAN_METADATA_MISMATCH", metadata=other)
+
+    def test_invalid_metadata_is_rejected_with_its_code(self) -> None:
+        broken = meta()
+        broken["commit_sha_full"] = "abc"
+        self.assert_blocked("METADATA_INVALID", metadata=broken)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def body(self, **overrides) -> str:
+        tr = FakeTransport()
+        run(tr, write=True, **overrides)
+        return tr.pr_created["body"]
+
+    def test_registry_run_scan_and_health_are_shown(self) -> None:
+        body = self.body()
+        for expected in (
+            "run_id `run-0003`", "Jenkins Build 번호 `3`",
+            "HARBOR `seokpan-hybrid/backend` / `" + NEW_BE + "` / `linux/amd64`",
+            "HARBOR `seokpan-hybrid/frontend` / `" + NEW_FE + "` / `linux/amd64`",
+            "Scan: `PASS`", "Health smoke: `PASS`", "Writer가 새로 검증한 결과가 아님",
+        ):
+            self.assertIn(expected, body)
+        self.assertNotIn("jenkins-controller", body)  # internal service URL is not copied into a public PR
+
+    def test_missing_provenance_is_marked_not_received(self) -> None:
+        bare = fx.metadata(be=NEW_BE, fe=NEW_FE)
+        plan = gitops_planner.plan_promotion(
+            bare, "recovery", ["backend", "frontend"], {gitops_planner.ENV_KUSTOMIZATION["recovery"]: fx.RECOVERY_KUST}
+        )
+        body = self.body(plan=plan, metadata=bare, candidate_text=make_candidate(metadata=bare))
+        self.assertIn("run_id `미수신`", body)
+        self.assertIn("Scan: `미수신`", body)
+
+    def test_copied_values_are_single_line_masked_and_length_limited(self) -> None:
+        m = meta()
+        m["components"]["backend"]["scan"] = "PASS\n## injected\n```x``` " + TOKEN + " " + "z" * 200
+        plan = make_plan()
+        body = self.body(metadata=m)
+        self.assertNotIn(TOKEN, body)
+        self.assertNotIn("\n## injected", body)
+        self.assertNotIn("```x```", body)
+        self.assertNotIn("z" * 100, body)
+
+    def test_lab_migration_held_scope_is_stated_only_when_it_changes(self) -> None:
+        tr = FakeTransport()
+        lab_branch_rid = LAB_RID
+        target.write_promotion(
+            tr, make_lab_plan(), meta(), lab_branch_rid, make_candidate(lab_branch_rid, "lab"), BASE, write=True
+        )
+        body = tr.pr_created["body"]
+        self.assertIn("held 상태", body)
+        self.assertIn(gitops_planner.MIGRATION_PATH, body)
+        self.assertIn("실행하지 않습니다", body)
+        self.assertNotIn("held 상태", self.body())  # recovery PR does not mention Migration
+
+
 class SecurityTests(unittest.TestCase):
     def test_redact_patterns(self) -> None:
         samples = [
@@ -317,7 +423,7 @@ class SecurityTests(unittest.TestCase):
     def test_api_has_no_credential_parameter(self) -> None:
         params = set(inspect.signature(target.write_promotion).parameters)
         self.assertEqual(
-            params, {"transport", "plan", "release_id", "candidate_text", "expected_base_sha", "write"}
+            params, {"transport", "plan", "metadata", "release_id", "candidate_text", "expected_base_sha", "write"}
         )
         self.assertFalse(inspect.signature(target.write_promotion).parameters["write"].default)
 
