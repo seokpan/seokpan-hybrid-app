@@ -155,17 +155,20 @@ class RedisChatAdapter:
         if not isinstance(scope, ChatScope):
             raise ChatRuleViolation("INVALID_CHAT_SCOPE")
         pubsub = self._client.pubsub()
+        transferred = False
         try:
             await pubsub.subscribe(RedisKeyspace.chat_channel(_scope_key(scope)))
-        except asyncio.CancelledError:
-            with suppress(RedisError):
-                await pubsub.aclose()  # type: ignore[no-untyped-call]
-            raise
+            subscription = _RedisChatSubscription(pubsub, max_queue_size=self._queue_limit)
+            transferred = True
+            return subscription
         except RedisError:
-            with suppress(RedisError):
-                await pubsub.aclose()  # type: ignore[no-untyped-call]
             raise ChatDeliveryUnavailable("CHAT_DELIVERY_UNAVAILABLE") from None
-        return _RedisChatSubscription(pubsub, max_queue_size=self._queue_limit)
+        finally:
+            if not transferred:
+                # Cleanup cannot mask the setup failure. Caller cancellation
+                # still propagates; a successful reader owns the PubSub.
+                with suppress(Exception):
+                    await pubsub.aclose()  # type: ignore[no-untyped-call]
 
     async def publish(self, command: SendChat) -> ChatReceipt:
         if not isinstance(command, SendChat):
