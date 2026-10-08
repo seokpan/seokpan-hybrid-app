@@ -46,23 +46,66 @@ async function join(page: Page) {
   await expect(page.getByRole("heading", { name: roomTitle, exact: true })).toBeVisible();
 }
 
+async function openWorkspaceDetails(page: Page, title: string) {
+  const trigger = page.getByRole("button", { name: new RegExp(title) });
+  await trigger.focus();
+  await trigger.press("Escape");
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await trigger.press("Enter");
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+}
+
+async function result(page: Page, title: string, turn: number, move: number) {
+  const dialog = page.getByRole("dialog", { name: "경기 결과", exact: true });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(title, { exact: true })).toBeVisible();
+  await expect(
+    dialog.getByText("마지막 투표 기회", { exact: true }).locator("..").locator("dd"),
+  ).toHaveText(String(turn) + "번째");
+  await expect(
+    dialog.getByText("공식 착수", { exact: true }).locator("..").locator("dd"),
+  ).toHaveText(String(move) + "수");
+  return dialog;
+}
+
+async function rating(page: Page, before: number, after: number, delta: string) {
+  const section = page
+    .getByRole("dialog", { name: "경기 결과", exact: true })
+    .getByRole("region", { name: "내 Rating 변동", exact: true });
+  await expect(section.getByRole("heading", { name: "내 Rating", exact: true })).toBeVisible();
+  await expect(section.locator("p")).toHaveText(String(before) + " → " + String(after));
+  await expect(section.getByText(delta, { exact: true })).toBeVisible();
+}
+
 async function roster(pages: Page[], name: string, ready: boolean) {
   for (const page of pages) {
+    await openWorkspaceDetails(page, "준비 현황 · 팀 설정");
     await expect(page.getByRole("listitem").filter({ hasText: name })).toContainText(
       ready ? " · Ready" : "미준비",
     );
   }
 }
 
-async function vote(page: Page, coordinate: string, team: "흑" | "백") {
+async function vote(page: Page, coordinate: string, team: "흑" | "백", finishesGame = false) {
   await expect(
     page.getByRole("heading", { name: `${team === "흑" ? "●" : "○"} ${team}팀 차례` }),
   ).toBeVisible();
   await page.getByRole("button", { name: `${coordinate} 빈 자리`, exact: true }).click();
+  await openWorkspaceDetails(page, "실시간 투표 현황");
   await expect(page.getByText(`내 투표: ${coordinate}`, { exact: true })).toBeVisible();
+  if (finishesGame) {
+    const dialog = page.getByRole("dialog", { name: "경기 결과", exact: true });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "보드 계속 보기", exact: true }).click();
+    await expect(dialog).not.toBeVisible();
+  }
   await expect(
     page.getByRole("button", { name: new RegExp(`^${coordinate} ${team}돌(?:, 마지막 착수)?$`) }),
   ).toBeVisible();
+  if (finishesGame) {
+    await page.getByRole("button", { name: "결과 보기", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "경기 결과", exact: true })).toBeVisible();
+  }
 }
 
 test("두 Member·Guest: 정상 5목 → 새로고침·CSRF·방장 승계 → 다음 판 → Guest PLAYER", async ({
@@ -146,22 +189,30 @@ test("두 Member·Guest: 정상 5목 → 새로고침·CSRF·방장 승계 → �
     await expect(black.getByLabel("방 채팅 메시지 입력", { exact: true })).toBeEnabled();
     await expect(black.getByRole("log")).toContainText(roomMessage);
     expect(await roomLog!.evaluate((node) => node.isConnected)).toBe(true);
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: "흑팀 선택" }).click();
+    await openWorkspaceDetails(white, "준비 현황 · 팀 설정");
     await expect(
       white.getByRole("heading", { name: "● 흑팀", exact: true }).locator(".."),
     ).toContainText(blackName);
+    await openWorkspaceDetails(white, "준비 현황 · 팀 설정");
     await white.getByRole("button", { name: "백팀 선택" }).click();
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await expect(
       black.getByRole("heading", { name: "○ 백팀", exact: true }).locator(".."),
     ).toContainText(whiteName);
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: "Ready", exact: true }).click();
     await roster(pages, blackName, true);
+    await openWorkspaceDetails(white, "준비 현황 · 팀 설정");
     await white.getByRole("button", { name: "Ready", exact: true }).click();
     await roster(pages, whiteName, true);
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: "게임 시작", exact: true }).click();
     await expect(
       guest.getByText("관전 중 · 이번 판에는 투표할 수 없습니다.", { exact: true }),
     ).toBeVisible();
+    await openWorkspaceDetails(guest, "실시간 투표 현황");
     await expect(guest.getByRole("button", { name: "투표 취소" })).toHaveCount(0);
     await expect(guest.getByText(/다른 빈 자리를 선택하면 표가 변경됩니다/)).toHaveCount(0);
     await guest.getByRole("button", { name: "게임 방법", exact: true }).click();
@@ -173,31 +224,35 @@ test("두 Member·Guest: 정상 5목 → 새로고침·CSRF·방장 승계 → �
     ).toBeVisible();
     await help.getByRole("button", { name: "확인하고 닫기" }).click();
     for (let index = 0; index < 5; index += 1) {
-      await vote(black, `${String.fromCharCode(65 + index)}1`, "흑");
+      await vote(black, `${String.fromCharCode(65 + index)}1`, "흑", index === 4);
       if (index < 4) await vote(white, `${String.fromCharCode(65 + 2 * index)}15`, "백");
     }
-    for (const page of pages) {
-      await expect(page.getByRole("heading", { name: "흑팀 승리", exact: true })).toBeVisible();
-      await expect(
-        page.getByText("마지막 투표 기회 9번째 · 공식 착수 9수", { exact: true }),
-      ).toBeVisible();
-    }
-    await expect(black.getByText("내 Rating: 1000 → 1016 (+16)", { exact: true })).toBeVisible();
-    await expect(white.getByText("내 Rating: 1000 → 984 (-16)", { exact: true })).toBeVisible();
+    for (const page of pages) await result(page, "흑팀 승리", 9, 9);
+    await rating(black, 1000, 1016, "+16");
+    await rating(white, 1000, 984, "-16");
     await expect(guest.getByText(/본인의 Rating 변동 내역이 없습니다/)).toBeVisible();
+    await black
+      .getByRole("dialog", { name: "경기 결과", exact: true })
+      .getByRole("button", { name: "보드 계속 보기", exact: true })
+      .click();
+    await expect(black.getByRole("dialog", { name: "경기 결과", exact: true })).not.toBeVisible();
     await black.getByRole("link", { name: "랭킹", exact: true }).click();
     await expect(black.getByRole("region", { name: "내 순위와 전적" })).toContainText("1,016");
     await expect(black.getByRole("table", { name: "Member 랭킹" })).toContainText(whiteName);
     await expect(black.getByLabel("전체 접속자", { exact: true })).toHaveText("접속 3명");
     await black.getByRole("link", { name: "← 참여 중인 방으로" }).click();
+    await black.getByRole("button", { name: "결과 보기", exact: true }).click();
+    await result(black, "흑팀 승리", 9, 9);
     await black.getByRole("button", { name: "결과 닫고 대기방 보기" }).click();
-    await expect(white.getByRole("heading", { name: "흑팀 승리", exact: true })).toBeVisible();
+    await result(white, "흑팀 승리", 9, 9);
     await white.getByRole("button", { name: "결과 닫고 대기방 보기" }).click();
     await guest.getByRole("button", { name: "결과 닫고 대기방 보기" }).click();
     await roster(pages, blackName, false);
     await roster(pages, whiteName, false);
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: "Ready", exact: true }).click();
     await roster(pages, blackName, true);
+    await openWorkspaceDetails(white, "준비 현황 · 팀 설정");
     await white.getByRole("button", { name: "Ready", exact: true }).click();
     await roster(pages, whiteName, true);
     await black.reload();
@@ -205,7 +260,8 @@ test("두 Member·Guest: 정상 5목 → 새로고침·CSRF·방장 승계 → �
     // Reload reconnects the same participant inside the disconnect lease.
     // The previous result must not be re-exposed, ownership and Ready survive.
     await expect(black.getByRole("heading", { name: "게임 준비", exact: true })).toBeVisible();
-    await expect(black.getByRole("heading", { name: "흑팀 승리", exact: true })).toHaveCount(0);
+    await expect(black.getByRole("dialog", { name: "경기 결과", exact: true })).toHaveCount(0);
+    await expect(black.getByRole("button", { name: "결과 보기", exact: true })).toHaveCount(0);
 
     await roster(pages, blackName, true);
     await roster(pages, whiteName, true);
@@ -219,38 +275,36 @@ test("두 Member·Guest: 정상 5목 → 새로고침·CSRF·방장 승계 → �
     await expect(white.getByRole("button", { name: "게임 시작", exact: true })).toHaveCount(0);
 
     // Mutation after reload verifies Session/CSRF recovery as well.
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: "게임 시작", exact: true }).click();
-    for (const page of pages) {
+    for (const page of pages)
       await expect(page.getByRole("button", { name: "A1 빈 자리", exact: true })).toBeVisible();
-      await expect(
-        page.getByRole("heading", { name: "양 팀 공동 패배", exact: true }),
-      ).toBeVisible();
-      await expect(
-        page.getByText("마지막 투표 기회 2번째 · 공식 착수 0수", { exact: true }),
-      ).toBeVisible();
+    for (const page of pages) {
+      await result(page, "양 팀 공동 패배", 2, 0);
       await page.getByRole("button", { name: "결과 닫고 대기방 보기" }).click();
     }
+    await openWorkspaceDetails(guest, "준비 현황 · 팀 설정");
     await guest.getByRole("button", { name: "흑팀 선택" }).click();
+    await openWorkspaceDetails(white, "준비 현황 · 팀 설정");
     await expect(
       white.getByRole("heading", { name: "● 흑팀", exact: true }).locator(".."),
     ).toContainText("Guest-");
+    await openWorkspaceDetails(guest, "준비 현황 · 팀 설정");
     await guest.getByRole("button", { name: "Ready", exact: true }).click();
     await roster(pages, "Guest-", true);
+    await openWorkspaceDetails(white, "준비 현황 · 팀 설정");
     await white.getByRole("button", { name: "Ready", exact: true }).click();
     await roster(pages, whiteName, true);
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: "게임 시작", exact: true }).click();
     await expect(
       black.getByText("관전 중 · 이번 판에는 투표할 수 없습니다.", { exact: true }),
     ).toBeVisible();
+    await openWorkspaceDetails(black, "실시간 투표 현황");
     await expect(black.getByRole("button", { name: "투표 취소" })).toHaveCount(0);
     await vote(guest, "H8", "흑");
     for (const page of pages) {
-      await expect(
-        page.getByRole("heading", { name: "양 팀 공동 패배", exact: true }),
-      ).toBeVisible();
-      await expect(
-        page.getByText("마지막 투표 기회 3번째 · 공식 착수 1수", { exact: true }),
-      ).toBeVisible();
+      await result(page, "양 팀 공동 패배", 3, 1);
     }
     await expect(black.getByText(/본인의 Rating 변동 내역이 없습니다/)).toBeVisible();
     await expect(guest.getByText(/본인의 Rating 변동 내역이 없습니다/)).toBeVisible();
@@ -258,6 +312,7 @@ test("두 Member·Guest: 정상 5목 → 새로고침·CSRF·방장 승계 → �
       await page.getByRole("button", { name: "결과 닫고 대기방 보기" }).click();
     const guestName = await guest.getByRole("button", { name: "사용자 메뉴" }).innerText();
     const guestDisplay = guestName.match(/Guest-[A-Z0-9]+/)![0];
+    await openWorkspaceDetails(black, "준비 현황 · 팀 설정");
     await black.getByRole("button", { name: `${guestDisplay} 강퇴`, exact: true }).click();
     await black
       .getByRole("dialog", { name: "참가자 강퇴" })
