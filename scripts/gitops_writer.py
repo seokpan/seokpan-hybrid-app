@@ -211,6 +211,31 @@ def _api(call, *args):
         raise WriterError("PROMOTION_API_ERROR", str(exc))
 
 
+def _after_pr_create_failure(transport: GitHubTransport, branch: str, commit_sha: str, exc: Exception) -> tuple:
+    """Delete the branch only when it is provably ours and no PR exists; otherwise leave it for a human.
+
+    A failed/unclear PR-create call may still have created the PR, and the branch name could have been
+    taken by another run in the meantime. Every doubt means "do not delete".
+    """
+    reason = redact(exc)
+    try:
+        prs = list(transport.find_pull_requests(branch))
+        head = transport.get_branch_sha(branch)
+    except TransportError as check_exc:
+        return "PROMOTION_PR_CREATE_UNCERTAIN", f"{reason} (branch kept: could not verify PR/branch state ({redact(check_exc)}); check {branch} manually)"
+    if prs:
+        return "PROMOTION_PR_CREATE_UNCERTAIN", f"{reason} (a pull request for {branch} exists; branch kept, check it manually)"
+    if head is None:
+        return "PROMOTION_PR_CREATE_FAILED", f"{reason} (branch already absent; nothing to delete)"
+    if head != commit_sha:
+        return "PROMOTION_PR_CREATE_UNCERTAIN", f"{reason} (branch kept: it no longer points at the commit this run pushed; check {branch} manually)"
+    try:
+        transport.delete_branch(branch)
+    except TransportError as cleanup_exc:
+        return "PROMOTION_PR_CREATE_FAILED", f"{reason} (branch cleanup failed ({redact(cleanup_exc)}); delete {branch} manually)"
+    return "PROMOTION_PR_CREATE_FAILED", f"{reason} (branch deleted)"
+
+
 def _check_images(plan: gitops_planner.PlanResult, metadata: Mapping, candidate: Mapping) -> None:
     """Candidate, plan and metadata must describe the same Image Digests/platforms."""
     try:
@@ -335,10 +360,6 @@ def write_promotion(
     try:
         pr_url = transport.create_pull_request(branch, BASE_BRANCH, title, body)
     except TransportError as exc:
-        cleanup = "branch deleted"
-        try:
-            transport.delete_branch(branch)
-        except TransportError as cleanup_exc:
-            cleanup = f"branch cleanup failed ({redact(cleanup_exc)}); delete {branch} manually"
-        raise WriterError("PROMOTION_PR_CREATE_FAILED", f"{exc} ({cleanup})")
+        code, message = _after_pr_create_failure(transport, branch, commit_sha, exc)
+        raise WriterError(code, message)
     return WriteResult("PR_CREATED", branch, paths, commit_sha, pr_url, title, tuple(plan.notes))

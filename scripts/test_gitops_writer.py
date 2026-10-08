@@ -319,6 +319,75 @@ class MutationFailureTests(unittest.TestCase):
         self.assertNotIn(TOKEN, str(ctx.exception))
 
 
+class PrCreateUncertaintyTests(unittest.TestCase):
+    """The branch is deleted only when it is provably ours and no PR exists."""
+
+    def fail_create(self) -> "FakeTransport":
+        tr = FakeTransport()
+        tr.fail["create_pull_request"] = "timeout"
+        return tr
+
+    def test_pr_exists_despite_the_error_keeps_the_branch(self) -> None:
+        tr = self.fail_create()
+        orig = tr.create_pull_request
+
+        def create_then_fail(head, base, title, body):
+            tr.prs.append(target.PullRequestInfo(1, head, "open", False, "https://example.invalid/pull/1"))
+            return orig(head, base, title, body)
+
+        tr.create_pull_request = create_then_fail
+        with self.assertRaises(target.WriterError) as ctx:
+            run(tr, write=True)
+        self.assertEqual(ctx.exception.code, "PROMOTION_PR_CREATE_UNCERTAIN")
+        self.assertNotIn(("delete_branch", BRANCH), tr.calls)
+        self.assertIn(BRANCH, tr.branches)
+
+    def test_branch_pointing_elsewhere_is_not_deleted(self) -> None:
+        tr = self.fail_create()
+        orig = tr.create_pull_request
+
+        def someone_else_took_it(head, base, title, body):
+            tr.branches[head] = "d" * 40
+            return orig(head, base, title, body)
+
+        tr.create_pull_request = someone_else_took_it
+        with self.assertRaises(target.WriterError) as ctx:
+            run(tr, write=True)
+        self.assertEqual(ctx.exception.code, "PROMOTION_PR_CREATE_UNCERTAIN")
+        self.assertNotIn(("delete_branch", BRANCH), tr.calls)
+        self.assertEqual(tr.branches[BRANCH], "d" * 40)
+
+    def test_unverifiable_state_keeps_the_branch(self) -> None:
+        tr = self.fail_create()
+        orig = tr.create_pull_request
+
+        def break_reads(head, base, title, body):
+            tr.fail["find_pull_requests"] = f"500 {TOKEN}"
+            return orig(head, base, title, body)
+
+        tr.create_pull_request = break_reads
+        with self.assertRaises(target.WriterError) as ctx:
+            run(tr, write=True)
+        self.assertEqual(ctx.exception.code, "PROMOTION_PR_CREATE_UNCERTAIN")
+        self.assertNotIn(TOKEN, str(ctx.exception))
+        self.assertNotIn(("delete_branch", BRANCH), tr.calls)
+        self.assertIn(BRANCH, tr.branches)
+
+    def test_branch_already_gone_is_not_deleted_again(self) -> None:
+        tr = self.fail_create()
+        orig = tr.create_pull_request
+
+        def vanish(head, base, title, body):
+            tr.branches.pop(head, None)
+            return orig(head, base, title, body)
+
+        tr.create_pull_request = vanish
+        with self.assertRaises(target.WriterError) as ctx:
+            run(tr, write=True)
+        self.assertEqual(ctx.exception.code, "PROMOTION_PR_CREATE_FAILED")
+        self.assertNotIn(("delete_branch", BRANCH), tr.calls)
+
+
 class ConsistencyTests(unittest.TestCase):
     def assert_blocked(self, code: str, **overrides) -> None:
         tr = FakeTransport()
