@@ -107,7 +107,6 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(c["record_kind"], "candidate")
         self.assertEqual(c["completeness"], "INCOMPLETE")
         self.assertEqual(c["release_id"], RID)
-        self.assertEqual(c["environment"], "lab")
         self.assertEqual(c["source"], {"app_sha": SHA, "infra_sha": None})
         self.assertEqual(c["images"]["backend"], {"ecr_digest": None, "harbor_digest": H_BE, "platform": "linux/amd64"})
         self.assertEqual(c["images"]["frontend"]["harbor_digest"], H_FE)
@@ -117,6 +116,24 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(
             c["missing_inputs"], ["SOURCE_COMMITS", "CONFIGURATION_REVISIONS", "RENDER_AND_REVIEW"]
         )
+
+    def test_top_level_keys_are_exactly_the_approved_04_10_3_contract(self) -> None:
+        approved = {
+            "schema_version", "record_kind", "completeness", "release_id", "source",
+            "images", "revisions", "review_refs", "verification", "missing_inputs",
+        }
+        for env, rid, meta in (
+            ("lab", RID, metadata()),
+            ("cloud", RID.replace("rel-lab", "rel-cloud"), metadata(ecr=True)),
+        ):
+            c = target.build_candidate(meta, env, rid, infra_sha=INFRA, revisions={"schema": "s1"})
+            self.assertEqual(set(c), approved)
+            self.assertEqual(set(c["source"]), {"app_sha", "infra_sha"})
+            self.assertEqual(set(c["images"]), {"frontend", "backend"})
+            for image in c["images"].values():
+                self.assertEqual(set(image), {"ecr_digest", "harbor_digest", "platform"})
+            self.assertEqual(set(c["revisions"]), set(target.REVISION_KEYS))
+            self.assertEqual(set(c["verification"]), {"render", "deployment", "acceptance"})
 
     def test_no_self_referencing_gitops_sha(self) -> None:
         text = target.render_json(target.build_candidate(metadata(), "lab", RID))

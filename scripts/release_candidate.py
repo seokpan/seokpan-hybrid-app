@@ -102,7 +102,11 @@ def build_candidate(
     infra_sha: Optional[str] = None,
     revisions: Optional[Mapping[str, str]] = None,
 ) -> dict:
-    """Candidate dict in the 04 §10.3 shape. Unreceived values stay null / NOT RUN."""
+    """Candidate dict in the exact 04 §10.3 shape. Unreceived values stay null / NOT RUN.
+
+    `env` is not a candidate field: it selects the required registry digest and must agree with the
+    environment embedded in `release_id`. Fields beyond 04 §10.3 are deliberately not added here.
+    """
     if env not in ENVIRONMENTS:
         raise ReleaseError("ENV_INVALID", "env must be one of lab, recovery, cloud")
     parsed = gitops_planner.parse_metadata(meta)  # validates SHA / digests / platforms / summary
@@ -143,8 +147,7 @@ def build_candidate(
         "record_kind": "candidate",
         "completeness": "INCOMPLETE",
         "release_id": release_id,
-        "environment": env,
-        "source": {"app_sha": parsed.app_sha, "infra_sha": infra_sha},
+        "source":{"app_sha": parsed.app_sha, "infra_sha": infra_sha},
         "images": images,
         "revisions": revision_block,
         "review_refs": [],
