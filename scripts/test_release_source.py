@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -211,6 +212,114 @@ class CliTests(unittest.TestCase):
         rc, _, err = self.call()
         self.assertEqual(rc, 2)
         self.assertIn("INPUT_UNREADABLE", err)
+
+
+class SymlinkSafetyTests(unittest.TestCase):
+    """The two output paths must be real files inside the checkout: nothing is followed or leaked."""
+
+    SECRET = "SECRET-OUTSIDE-CONTENT\n"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.gitops = self.root / "gitops"
+        (self.gitops / KUST).parent.mkdir(parents=True)
+        (self.gitops / KUST).write_text(kust_text(), encoding="utf-8")
+        self.release = self.root / "rel.json"
+        self.release.write_text(candidate(), encoding="utf-8")
+        self.outside = self.root / "outside.txt"
+        self.outside.write_text(self.SECRET, encoding="utf-8")
+
+    def call(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--env", "recovery", "--release-file", str(self.release), "--gitops-dir", str(self.gitops), *extra]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = target.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def assert_rejected_everywhere(self, outside_files: dict) -> None:
+        before = {p: p.read_bytes() for p in outside_files}
+        for extra in ((), ("--write",)):
+            with self.subTest(extra=extra):
+                rc, out, err = self.call(*extra)
+                self.assertEqual(rc, 2)
+                self.assertIn("UNSAFE_PATH", err)
+                self.assertNotIn("SECRET-OUTSIDE", out + err)  # nothing outside is read or printed
+                self.assertNotIn("RELEASE_SOURCE_STATUS", out)
+        for path, data in before.items():
+            self.assertEqual(path.read_bytes(), data)  # nothing outside is changed
+
+    def test_release_source_symlink_to_an_outside_file(self) -> None:
+        (self.gitops / SRC).symlink_to(self.outside)
+        self.assert_rejected_everywhere({self.outside: b""})
+        self.assertEqual(self.outside.read_text(encoding="utf-8"), self.SECRET)
+
+    def test_dangling_release_source_symlink_does_not_create_the_target(self) -> None:
+        ghost = self.root / "not-yet.txt"
+        (self.gitops / SRC).symlink_to(ghost)
+        self.assert_rejected_everywhere({})
+        self.assertFalse(ghost.exists())
+
+    def test_kustomization_symlink_to_an_outside_file(self) -> None:
+        real = self.root / "k.yaml"
+        real.write_text(kust_text(), encoding="utf-8")
+        (self.gitops / KUST).unlink()
+        (self.gitops / KUST).symlink_to(real)
+        self.assert_rejected_everywhere({real: b""})
+        self.assertEqual(real.read_text(encoding="utf-8"), kust_text())
+        self.assertFalse((self.gitops / SRC).exists())
+
+    def test_intermediate_directory_symlink(self) -> None:
+        ext = self.root / "ext"
+        ext.mkdir()
+        (self.gitops / "apps/overlays/recovery").rename(ext / "recovery")
+        (self.gitops / "apps/overlays/recovery").symlink_to(ext / "recovery")
+        self.assert_rejected_everywhere({})
+        self.assertEqual(sorted(p.name for p in (ext / "recovery").iterdir()), ["kustomization.yaml"])
+
+    def test_higher_directory_symlink(self) -> None:
+        ext = self.root / "ext"
+        ext.mkdir()
+        (self.gitops / "apps").rename(ext / "apps")
+        (self.gitops / "apps").symlink_to(ext / "apps")
+        self.assert_rejected_everywhere({})
+        self.assertFalse((ext / "apps/overlays/recovery" / "release-source.yaml").exists())
+
+    def test_hard_linked_and_non_regular_outputs_are_rejected(self) -> None:
+        os.link(self.outside, self.gitops / SRC)  # hard link to an outside file
+        self.assert_rejected_everywhere({self.outside: b""})
+        (self.gitops / SRC).unlink()
+        (self.gitops / SRC).mkdir()  # a directory where the file should be
+        rc, _, err = self.call("--write")
+        self.assertEqual((rc, "UNSAFE_PATH" in err), (2, True))
+
+    def test_nothing_is_written_when_any_output_path_is_unsafe(self) -> None:
+        (self.gitops / SRC).symlink_to(self.outside)
+        before = (self.gitops / KUST).read_bytes()
+        self.call("--write")
+        self.assertEqual((self.gitops / KUST).read_bytes(), before)  # kustomization not half-updated
+
+    def test_the_checkout_root_itself_may_be_a_symlink_and_normal_runs_work(self) -> None:
+        link = self.root / "workspace-link"
+        link.symlink_to(self.gitops)
+        self.gitops = link
+        rc, out, _ = self.call("--write")
+        self.assertEqual(rc, 0)
+        self.assertIn("RELEASE_SOURCE_STATUS=WRITTEN", out)
+        self.assertEqual((link / SRC).read_text(encoding="utf-8"), target.render_source(wx.RID, APP_SHA))
+        rc, out, _ = self.call("--write")
+        self.assertIn("RELEASE_SOURCE_STATUS=NO_CHANGE", out)  # idempotent
+        self.assertFalse((link / SRC).is_symlink())
+
+    def test_existing_regular_file_is_updated_in_place_when_the_release_changes(self) -> None:
+        self.call("--write")
+        other = f"rel-recovery-20261009T010000Z-{APP_SHA[:12]}-c3d4e5f6"
+        self.release.write_text(candidate(rid=other), encoding="utf-8")
+        rc, out, _ = self.call("--write")
+        self.assertEqual(rc, 0)
+        self.assertIn(other, (self.gitops / SRC).read_text(encoding="utf-8"))
+        self.assertNotIn(wx.RID, (self.gitops / SRC).read_text(encoding="utf-8"))
 
 
 class SourceTests(unittest.TestCase):
