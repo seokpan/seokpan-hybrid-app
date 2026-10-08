@@ -1,5 +1,6 @@
 // 작성자: 최유준
 // 작성 날짜: 2026-10-06
+// 수정 날짜: 2026-10-08 (Promotion Stage 추가, 기본 OFF)
 //
 // ============================================================================
 // seokpan-hybrid-app :: main Image Pipeline (ECR Primary + Harbor Recovery)
@@ -12,7 +13,8 @@
 //   D  버전 고정 aws-cli Container를 이 Jenkinsfile의 inline Pod에 추가
 //      (1차 공유 Pod Template은 수정하지 않는다)
 //   E  2차 전용 Jenkins Folder 범위 Credential (등록 방식은 실측 후 확정)
-//   F  GitOps Writer PAT는 별도 Stage/작업 범위 (이 Pipeline에서는 사용하지 않음)
+//   F  GitOps Writer PAT는 별도 Stage 범위. 'Promote GitOps (Recovery PR)' Stage 안에서만
+//      withCredentials로 주입하며, 이미지 Build/Push Stage에는 주입하지 않는다.
 //
 // 흐름:
 //   main Commit
@@ -34,9 +36,11 @@
 //   - Platform을 판별하지 못하면 Evidence 기록 중단
 //
 // 이 Pipeline이 하지 않는 것 (별도 작업):
-//   - hybrid-gitops Promotion PR (구조가 1차와 달라 scripts/promote_gitops.py 개정 필요).
-//     Evidence는 gitops_change=NONE으로 남긴다. Cloud는 ecr.final_digest,
+//   - hybrid-gitops Promotion PR은 PROMOTION_MODE=OFF(기본)일 때 만들지 않는다.
+//     Evidence(image-metadata.json)는 gitops_change=NONE으로 남기며, Promotion 결과(PR URL)는
+//     별도 파일(promotion-result.txt)에만 기록한다. Cloud는 ecr.final_digest,
 //     Recovery는 harbor.final_digest를 사용하며 두 Digest가 같다고 가정하지 않는다.
+//   - Promotion Stage는 Recovery 환경만 대상으로 한다. lab(승인 매핑 전)·cloud(ECR 입력 전)는 보류.
 //   - Harbor 비승인 Artifact Retention, ECR Lifecycle 최종 N (Preview 후 확정)
 //
 // 실행 모드 (Build Parameter ENABLE_ECR, 기본 false):
@@ -94,6 +98,19 @@ def HEALTH_CFG = [
 // TODO(#2 E): 2차 Harbor Project 전용 Recovery Pull Robot Secret이 생기면 이름을 확정한다.
 def SMOKE_PULL_SECRETS = ['harbor-pull-secret', 'hybrid-harbor-pull-secret']
 
+// Promotion 실행 헬퍼. 출력은 promotion-result.txt로 남기고 exit 2(또는 0이 아닌 값)는 Build 실패로 처리한다.
+// PROMOTION_PR_CREATE_UNCERTAIN 등 불확실 상태는 자동 재시도하지 않고 사람이 GitHub에서 확인한다.
+def runPromotion(String modeFlag) {
+    def rc = sh(
+        returnStatus: true,
+        script: "python3 scripts/gitops_promote.py --env recovery --metadata image-metadata.json --gitops-dir .ci/gitops ${modeFlag} > promotion-result.txt 2>&1"
+    )
+    echo readFile('promotion-result.txt')
+    if (rc != 0) {
+        error("GitOps Promotion 실패(exit=${rc}). promotion-result.txt의 PROMOTION_ERROR를 확인하세요. 불확실 상태는 GitHub에서 Branch/PR을 수동 확인하고 자동 재시도하지 마세요.")
+    }
+}
+
 pipeline {
     agent none
 
@@ -102,6 +119,11 @@ pipeline {
             name: 'ENABLE_ECR',
             defaultValue: false,
             description: 'true: ECR+Harbor 동시 Push/Promote (aws-cli Pin·ECR Credential 필요). false: Harbor-only.'
+        )
+        choice(
+            name: 'PROMOTION_MODE',
+            choices: ['OFF', 'PLAN', 'REMOTE_CHECK', 'WRITE'],
+            description: 'GitOps Promotion (recovery). OFF=실행 안 함(기본), PLAN=오프라인 계획만(Credential 없음), REMOTE_CHECK=GitHub 읽기 전용 점검, WRITE=Promotion Branch push + PR 1건 생성.'
         )
     }
 
@@ -792,6 +814,10 @@ PYEOF
                                 if (ecrOn()) { extra << '--enable-ecr' }
                                 sh "python3 scripts/image_registry.py evidence --state-dir .ci/state --candidate-tag ${env.CANDIDATE_TAG} --final-tag ${env.FINAL_TAG} ${extra.join(' ')} --out image-metadata.json"
                                 archiveArtifacts artifacts: 'image-metadata.json', fingerprint: true
+                                if (params.PROMOTION_MODE != 'OFF') {
+                                    // Promotion Stage가 다른 Agent에서 읽는다. Credential은 포함하지 않는다.
+                                    stash name: 'image-evidence', includes: 'image-metadata.json'
+                                }
                                 archiveArtifacts artifacts: '.ci/state/*.json', allowEmptyArchive: true
                                 echo 'Evidence 기록 완료: image-metadata.json'
                             }
@@ -803,6 +829,90 @@ PYEOF
                 always {
                     // 인증 자료는 Run이 끝나면 Workspace에서 지운다 (archive 대상은 .ci/state/*.json뿐).
                     sh 'rm -rf .ci/dockercfg .ci/ecr-password .ci/ca-bundle.crt || true'
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // GitOps Promotion (recovery 전용, 기본 OFF).
+        // Credential이 없는 app-ci-check Agent에서 실행한다 (Registry 쓰기 Credential 분리).
+        // hybrid-gitops-writer PAT는 PLAN 이외 모드의 python 실행 구간에만 주입한다.
+        // 결과는 PR 1건까지만 만든다. Merge는 사람이 Review 후 한다.
+        // --------------------------------------------------------------
+        stage('Promote GitOps (Recovery PR)') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { params.PROMOTION_MODE != 'OFF' }
+                    expression { env.P1_PASSED == 'true' }
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                }
+            }
+            agent { kubernetes { inheritFrom 'app-ci-check' } }
+            environment {
+                HOME = '/tmp'
+                GITOPS_URL = 'https://github.com/seokpan/seokpan-hybrid-gitops.git'
+                GITOPS_WRITER_CRED = 'hybrid-gitops-writer'
+            }
+            stages {
+                stage('Prepare (pinned SHA + Evidence)') {
+                    steps {
+                        container('app-ci') {
+                            script {
+                                if (env.CHANGE_ID || env.BRANCH_NAME != 'main') {
+                                    error('Promotion은 main 브랜치 Build에서만 실행합니다.')
+                                }
+                                def scmVars = checkout scm
+                                if (scmVars.GIT_COMMIT != env.SEOKPAN_GIT_SHA) {
+                                    error("Commit mismatch on Promotion agent: expected ${env.SEOKPAN_GIT_SHA}, got ${scmVars.GIT_COMMIT}")
+                                }
+                                unstash 'image-evidence'
+                                sh '''
+                                    set -eu
+                                    git --version
+                                    python3 --version
+                                    rm -rf .ci/gitops
+                                    mkdir -p .ci
+                                    git -c credential.helper= clone "$GITOPS_URL" .ci/gitops
+                                    test "$(git -C .ci/gitops remote get-url --push origin)" = "$GITOPS_URL"
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Promotion Plan (offline)') {
+                    when { expression { params.PROMOTION_MODE == 'PLAN' } }
+                    steps {
+                        container('app-ci') {
+                            script {
+                                runPromotion('')
+                            }
+                        }
+                    }
+                }
+
+                stage('Promotion (credentialed)') {
+                    when { expression { params.PROMOTION_MODE == 'REMOTE_CHECK' || params.PROMOTION_MODE == 'WRITE' } }
+                    steps {
+                        container('app-ci') {
+                            withCredentials([usernamePassword(
+                                credentialsId: env.GITOPS_WRITER_CRED,
+                                usernameVariable: 'GH_USER',
+                                passwordVariable: 'GH_TOKEN'
+                            )]) {
+                                script {
+                                    runPromotion(params.PROMOTION_MODE == 'WRITE' ? '--write' : '--remote-check')
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    sh 'rm -rf .ci/gitops || true'
+                    archiveArtifacts artifacts: 'promotion-result.txt', allowEmptyArchive: true
                 }
             }
         }
