@@ -397,7 +397,10 @@ describe("game screen flow", () => {
     version++;
     act(() => socket.message(event("game.finished", version, {}, "r1")));
     await screen.findByRole("heading", { name: "흑팀 승리" });
-    expect(screen.getByText("내 Rating: 1000 → 1016 (+16)")).toBeInTheDocument();
+    const resultDialog = await screen.findByRole("dialog", { name: "경기 결과" });
+    expect(within(resultDialog).getByRole("region", { name: "내 Rating 변동" })).toHaveTextContent(
+      "내 Rating1000 → 1016+16",
+    );
     const requests = fetcher.mock.calls.length;
     fireEvent.click(screen.getByRole("button", { name: "결과 닫고 대기방 보기" }));
     expect(screen.getByRole("grid")).toBe(sharedBoard);
@@ -415,7 +418,8 @@ describe("game screen flow", () => {
     fireEvent.click(startButton());
     await screen.findByRole("heading", { name: "● 흑팀 차례" });
     expect(screen.getByText("투표 기회 1번째 · 공식 착수 0수")).toBeInTheDocument();
-    expect(screen.queryByText("내 Rating: 1000 → 1016 (+16)")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "경기 결과" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "내 Rating 변동" })).not.toBeInTheDocument();
     expect(starts).toBe(2);
     expect(socket.close).not.toHaveBeenCalled();
     version++;

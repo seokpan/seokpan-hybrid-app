@@ -28,11 +28,6 @@
   letter-spacing: -0.02em;
   white-space: nowrap;
 }
-.brand > span:first-child {
-  color: #54e0e5;
-  letter-spacing: -0.18rem;
-  margin-right: 0.08rem;
-}
 .headerControls {
   min-width: 0;
   display: flex;
@@ -130,6 +125,30 @@
 .hero strong {
   color: #007d8c;
 }
+.hero .welcomeTitle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.15em;
+  line-height: 1.25;
+}
+.heroStone {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 1.15em;
+  height: 1.15em;
+  font-size: 1.05em;
+  font-family: "Batang", "바탕", "Songti SC", serif;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+  color: #006570;
+  background: #e7f1f1;
+  border: 1px solid #98bfc3;
+  border-radius: 0.16em;
+  box-shadow: 0 2px 0 #bad5d8;
+}
 .authGrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -174,10 +193,23 @@
 .guestCard p {
   color: #dce9f7;
   line-height: 1.8;
+  word-break: keep-all;
+  overflow-wrap: break-word;
 }
 .stones {
-  font-size: 3rem;
-  letter-spacing: -0.4rem;
+  align-self: flex-start;
+  margin-bottom: 0.35rem;
+}
+.guestIntro,
+.guestTerms {
+  margin: 0;
+}
+.guestIntro > span,
+.guestTerms > span {
+  display: block;
+}
+.guestMemberRule {
+  margin-top: 0.55rem;
 }
 .card label {
   display: block;
@@ -198,6 +230,21 @@
 }
 .authCard {
   min-height: 440px;
+}
+.authFeedback {
+  height: 5.25rem;
+  margin-top: 0.75rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.authFeedback > .error {
+  margin: 0;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
 }
 .authDialog {
   width: min(480px, calc(100% - 2rem));
@@ -478,14 +525,14 @@
     grid-template-columns: 1fr;
     gap: 1rem;
   }
+  .authFeedback {
+    height: 6.5rem;
+  }
   .shell {
     padding-top: 1.25rem;
   }
   .guestCard {
     gap: 0.25rem;
-  }
-  .stones {
-    font-size: 2rem;
   }
   .header {
     padding-inline: 0.85rem;
@@ -573,6 +620,93 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  padding: 0.85rem 1rem;
+}
+.roomToolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem 1rem;
+  min-height: 44px;
+  margin-bottom: 0.4rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid #e0e5ee;
+}
+.roomIdentity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+.roomLabel {
+  font-size: 0.65rem;
+  font-weight: 750;
+  letter-spacing: 0.09em;
+  color: #007681;
+}
+.roomIdentity h1 {
+  max-width: 26rem;
+  margin: 0;
+  font-size: 1.25rem;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roomMeta {
+  flex: 1;
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: #52617a;
+  word-break: keep-all;
+}
+.roomActions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+.roomActions > button {
+  min-height: 36px;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.82rem;
+}
+.roomLeaveHelp {
+  position: relative;
+  color: #52617a;
+  font-size: 0.75rem;
+}
+.roomLeaveHelp summary {
+  cursor: pointer;
+}
+.roomLeaveHelp p {
+  position: absolute;
+  z-index: 8;
+  top: 100%;
+  right: 0;
+  width: min(26rem, 70vw);
+  margin: 0;
+  padding: 0.8rem;
+  border: 1px solid #cbd7e5;
+  border-radius: 0.65rem;
+  background: #fff;
+  box-shadow: 0 8px 24px rgb(23 43 73 / 15%);
+  line-height: 1.6;
+  word-break: keep-all;
+}
+@media (max-width: 1050px) {
+  .roomToolbar {
+    flex-wrap: wrap;
+    gap: 0.3rem 0.75rem;
+  }
+  .roomIdentity h1 {
+    max-width: 44vw;
+  }
+  .roomMeta {
+    flex: 1 1 auto;
+  }
 }
 .roomShell .roomCard > .sectionHeading,
 .roomShell .roomCard > .notice,
@@ -605,10 +739,27 @@
   font-size: 1rem;
 }
 .roomShell .waitingTeams ul {
-  height: 4.75rem;
+  height: auto;
+  max-height: none;
+  overflow: visible;
   margin: 0.35rem 0;
   scrollbar-width: none;
   scrollbar-gutter: auto;
+}
+.roomShell .waitingTeams .teamPanel li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.15rem 0.35rem;
+  line-height: 1.5;
+  padding-block: 0.3rem;
+}
+.roomShell .waitingTeams .teamPanel li > button {
+  width: auto;
+  min-height: 28px;
+  padding: 0.2rem 0.4rem;
+  margin-left: auto;
+  font-size: 0.75rem;
 }
 .roomShell .waitingTeams ul::-webkit-scrollbar,
 .roomShell .roomCard > p[id="room-leave-impact"]::-webkit-scrollbar {

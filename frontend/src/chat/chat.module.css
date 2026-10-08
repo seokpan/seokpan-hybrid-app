@@ -98,6 +98,63 @@
   margin: 0.4rem 0 0;
   overflow-wrap: anywhere;
 }
+.roomPanel .feedback[data-empty="true"] {
+  min-height: 0;
+  margin: 0;
+}
+.roomPanel .newMessages[data-empty="true"] {
+  display: none;
+}
+.panel > h2,
+.panel > .hint,
+.panel > .newMessages,
+.panel > form {
+  flex: 0 0 auto;
+}
+.panel > form {
+  padding-top: 0.6rem;
+}
+.panel.roomPanel {
+  padding: 0.65rem;
+}
+.panel.roomPanel h2 {
+  font-size: 0.875rem;
+  line-height: 1.35;
+  margin: 0 0 0.35rem;
+}
+.roomPanel .log {
+  padding-block: 0.35rem;
+}
+.roomPanel .message {
+  font-size: 0.825rem;
+  line-height: 1.4;
+  margin: 0.3rem 0.15rem;
+}
+.roomPanel .message time {
+  font-size: 0.7rem;
+}
+.panel.roomPanel label {
+  font-size: 0.75rem;
+  margin: 0 0 0.3rem;
+}
+.panel.roomPanel > form {
+  padding-top: 0.5rem;
+}
+.roomPanel .hint {
+  font-size: 0.75rem;
+  line-height: 1.35;
+  margin: 0.3rem 0;
+}
+.roomPanel .composer textarea {
+  min-height: 44px;
+  max-height: 4rem;
+  font-size: 0.825rem;
+  padding: 0.45rem;
+}
+.roomPanel .composer button {
+  font-size: 0.825rem;
+  min-width: 52px;
+}
 .lobbyLayout {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);

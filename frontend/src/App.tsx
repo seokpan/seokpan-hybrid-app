@@ -12,6 +12,7 @@ import { RankingsPage } from "./statistics/RankingsPage";
 import { UserMenu } from "./statistics/UserMenu";
 import { GameHelp } from "./help/GameHelp";
 import { OnlineCount } from "./presence/OnlineCount";
+import { StoneMark } from "./brand/StoneMark";
 
 function SessionGate({
   authPage = false,
@@ -131,7 +132,7 @@ function Shell() {
       <header className={styles.header}>
         <div className={styles.headerInner}>
           <Link to="/" className={styles.brand} aria-label="石나가는 판단 홈">
-            <span aria-hidden="true">● ○</span>
+            <StoneMark />
             <span>石나가는 판단</span>
           </Link>
           {view.phase === "ready" && !blocking && (

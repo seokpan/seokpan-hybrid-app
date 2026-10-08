@@ -5,6 +5,7 @@ import { useSession } from "../session/context";
 import { validateCredentials } from "./validation";
 import styles from "../styles/screens.module.css";
 import { RegistrationDialog } from "./RegistrationDialog";
+import { StoneMark } from "../brand/StoneMark";
 
 function CredentialsForm({
   registering = false,
@@ -19,6 +20,7 @@ function CredentialsForm({
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const prefix = registering ? "signup" : "signin";
+  const feedback = error ?? (registering && !auth.busy ? auth.notice : "");
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -82,16 +84,13 @@ function CredentialsForm({
       <small id={`${prefix}-password-hint`}>
         8~64자. 공백·대소문자를 입력한 그대로 사용합니다.
       </small>
-      {error && (
-        <p role="alert" className={styles.error}>
-          {error}
-        </p>
-      )}
-      {registering && auth.notice && !auth.busy && (
-        <p role="alert" className={styles.error}>
-          {auth.notice}
-        </p>
-      )}
+      <div className={styles.authFeedback}>
+        {feedback && (
+          <p role="alert" className={styles.error}>
+            {feedback}
+          </p>
+        )}
+      </div>
       <button className={styles.primaryButton} type="submit" disabled={auth.busy}>
         {registering ? "가입하기" : "로그인"}
       </button>
@@ -122,7 +121,10 @@ export function AuthPage() {
         )}
         <section className={styles.hero} aria-labelledby="welcome-title">
           <p className="eyebrow">함께 만드는 한 수</p>
-          <h1 id="welcome-title">石나가는 판단</h1>
+          <h1 id="welcome-title" className={styles.welcomeTitle} aria-label="石나가는 판단">
+            <span className={styles.heroStone}>石</span>
+            <span>나가는 판단</span>
+          </h1>
           <p>
             함께 투표하고, <strong>하나의 수</strong>를 결정하세요.
           </p>
@@ -132,11 +134,11 @@ export function AuthPage() {
             className={`${styles.card} ${styles.guestCard} ${styles.authCard}`}
             aria-labelledby="guest-title"
           >
-            <span className={styles.stones} aria-hidden="true">
-              ● ○
-            </span>
+            <StoneMark size="large" className={styles.stones} />
             <h2 id="guest-title">Guest로 시작</h2>
-            <p>회원가입 없이 팀에 참여하고 함께 투표할 수 있습니다.</p>
+            <p className={styles.guestIntro}>
+              <span>회원가입 없이 팀에 참여하고</span> <span>함께 투표할 수 있습니다.</span>
+            </p>
             {!existingGuest && (
               <button
                 className={styles.tealButton}
@@ -150,8 +152,9 @@ export function AuthPage() {
                 Guest로 시작하기 →
               </button>
             )}
-            <p>
-              Guest의 개인 전적과 Rating은 영구 저장되지 않습니다. 방 생성은 Member만 가능합니다.
+            <p className={styles.guestTerms}>
+              <span>Guest의 개인 전적과 Rating은</span> <span>영구 저장되지 않습니다.</span>{" "}
+              <span className={styles.guestMemberRule}>방 생성은 Member만 가능합니다.</span>
             </p>
           </section>
           <section className={`${styles.card} ${styles.authCard}`} aria-labelledby="auth-title">

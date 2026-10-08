@@ -1,0 +1,52 @@
+.mark {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  isolation: isolate;
+  line-height: 1;
+  vertical-align: middle;
+}
+.compact {
+  font-size: 1.55rem;
+}
+.large {
+  font-size: clamp(3rem, 5vw, 4rem);
+}
+.stone {
+  display: block;
+  width: 1em;
+  height: 1em;
+  border-radius: 50%;
+}
+.black {
+  transform: translateY(0.055em);
+  border: 1px solid #616975;
+  background: radial-gradient(
+    circle at 32% 25%,
+    #545b65 0%,
+    #20252c 30%,
+    #090b0f 68%,
+    #030407 100%
+  );
+  box-shadow:
+    inset 0 1px 1px #ffffff38,
+    inset 0 -2px 3px #00000080,
+    0 3px 6px #00000038;
+}
+.white {
+  position: relative;
+  margin-left: -0.19em;
+  transform: translateY(-0.055em);
+  border: 1px solid #c9d1db;
+  background: radial-gradient(
+    circle at 32% 25%,
+    #ffffff 0%,
+    #ffffff 32%,
+    #f4f5f7 65%,
+    #d9dfe6 100%
+  );
+  box-shadow:
+    inset 0 1px 1px #ffffff,
+    inset 0 -2px 3px #a2abb533,
+    0 3px 6px #00000030;
+}

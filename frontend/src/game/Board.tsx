@@ -13,6 +13,7 @@ export function Board({
   onVote,
   focusScope,
   lastMove = null,
+  fitToRegion = false,
 }: {
   cells: Game["board"];
   forbidden?: string[];
@@ -23,6 +24,7 @@ export function Board({
   focusScope?: string;
   votes?: VoteSummary["rows"];
   lastMove?: Game["last_move"];
+  fitToRegion?: boolean;
 }) {
   const [focus, setFocus] = useState(112);
   const [expanded, setExpanded] = useState(false);
@@ -43,7 +45,7 @@ export function Board({
   const stones = new Map(cells.map((c) => [c.coordinate, c.stone]));
   const tally = new Map(votes.map((v) => [v.coordinate, v]));
   return (
-    <div className={styles.boardFrame}>
+    <div className={`${styles.boardFrame} ${fitToRegion ? styles.fitBoard : ""}`}>
       <div className={styles.boardTools}>
         <span>{expanded ? "좌우로 밀어 보드를 확인하세요." : "보드 전체 보기"}</span>
         <button

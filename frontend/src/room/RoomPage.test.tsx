@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
@@ -392,7 +392,11 @@ describe("room HTTP and receive-only connection integration", () => {
     const waitingBoard = screen.getByRole("grid", { name: "15×15 오목판" });
     const emptyCell = screen.getByRole("button", { name: "H8 빈 자리" });
     expect(emptyCell).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByText("Ready 0명 / 최소 2명")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "게임 시작 준비" })).getByText(
+        "Ready 0명 / 최소 2명",
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(/방장이 나가면 접속 중인 Member에게 권한이 넘어가고/),
     ).toBeInTheDocument();
@@ -463,7 +467,11 @@ describe("room HTTP and receive-only connection integration", () => {
       ),
     );
 
-    expect(screen.getByText("Ready 1명 / 최소 2명")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "게임 시작 준비" })).getByText(
+        "Ready 1명 / 최소 2명",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "게임 시작" })).toBeDisabled();
   });
 
