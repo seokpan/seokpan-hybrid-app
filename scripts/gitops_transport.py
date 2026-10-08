@@ -33,6 +33,7 @@ from typing import Callable, Mapping, Optional, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitops_writer as writer  # noqa: E402
+import safe_fs  # noqa: E402
 
 API_BASE = "https://api.github.com"
 ALLOWED_REPOS = ("seokpan/seokpan-hybrid-gitops",)
@@ -339,12 +340,17 @@ class GitHubApiTransport(writer.GitHubTransport):
             raise writer.TransportError("checkout HEAD differs from the base sha")
         if self._git(["status", "--porcelain"]).strip():
             raise writer.TransportError("checkout has uncommitted changes")
+        try:  # every target must be a real file/dir inside the checkout, before anything is touched
+            for path in clean:
+                safe_fs.verify_writable(self._checkout, path)
+        except safe_fs.SafeFsError as exc:
+            raise writer.TransportError(str(exc))
         self._git(["switch", "-c", branch])
-        for path, text in clean.items():
-            target = self._checkout / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with open(target, "w", encoding="utf-8", newline="") as handle:
-                handle.write(text)
+        try:
+            for path, text in clean.items():
+                safe_fs.write_text(self._checkout, path, text, make_dirs=True)  # no-follow, exact bytes
+        except safe_fs.SafeFsError as exc:
+            raise writer.TransportError(str(exc))
         changed = set(self._git(["diff", "--name-only"]).splitlines()) | set(
             self._git(["ls-files", "--others", "--exclude-standard"]).splitlines()
         )

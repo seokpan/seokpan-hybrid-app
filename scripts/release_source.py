@@ -19,21 +19,17 @@ Fail-closed rules:
 
 Default is a dry run that prints a diff; `--write` only writes the two files into the checkout.
 
-Path safety: every read and write of the two files goes through no-follow directory-fd opens, so a
-symbolic link at any component below `--gitops-dir` (the file itself or an intermediate directory),
-a non-regular file, or a hard-linked file (link count > 1) is rejected with UNSAFE_PATH before any
-content is read, printed or written. This needs POSIX `O_NOFOLLOW`; without it the tool refuses to run.
+Path safety: every read and write of the two files goes through safe_fs (no-follow directory-fd
+opens), so a symbolic link at any component below `--gitops-dir`, a non-regular file, or a hard-linked
+file is rejected with UNSAFE_PATH before any content is read, printed or written.
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
-import errno
 import json
-import os
 import re
-import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitops_planner  # noqa: E402
 import release_candidate  # noqa: E402
+import safe_fs  # noqa: E402
 
 SOURCE_FILE = "release-source.yaml"
 APP_SHA_KEY = "seokpan.io/app-source-sha"
@@ -209,76 +206,15 @@ def plan_release_source(candidate_text: str, env: str, files: Mapping[str, str])
     return SourcePlan(env, release_id, app_sha, old, new)
 
 
-def _require_nofollow() -> None:
-    if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd):
-        raise ReleaseSourceError("PLATFORM_UNSUPPORTED", "no-follow file access is not available on this platform")
-
-
-def _unsafe(rel: str, why: str) -> ReleaseSourceError:
-    return ReleaseSourceError("UNSAFE_PATH", f"{rel}: {why}")
-
-
-def _open_no_follow(root: Path, rel: str, flags: int):
-    """Open `rel` below `root` without following any symlink; returns the file descriptor.
-
-    Each directory component is opened relative to the previous fd with O_NOFOLLOW|O_DIRECTORY, then
-    the final component with O_NOFOLLOW, so there is no check-then-use gap to race. Raises
-    FileNotFoundError when a component does not exist and ReleaseSourceError(UNSAFE_PATH) for a
-    symlink / non-directory component.
-    """
-    _require_nofollow()
-    parts = rel.split("/")
-    try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)  # the checkout root itself may be a link
-    except OSError as exc:
-        raise ReleaseSourceError("CHECKOUT_UNREADABLE", f"--gitops-dir cannot be opened ({type(exc).__name__})")
-    try:
-        for part in parts[:-1]:
-            try:
-                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            except FileNotFoundError:
-                raise
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise _unsafe(rel, "a parent directory is a symbolic link or not a directory")
-                raise ReleaseSourceError("INPUT_UNREADABLE", f"{rel}: cannot open parent ({type(exc).__name__})")
-            os.close(fd)
-            fd = nxt
-        try:
-            return os.open(parts[-1], flags | os.O_NOFOLLOW, 0o644, dir_fd=fd)
-        except FileNotFoundError:
-            raise
-        except FileExistsError:
-            raise
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
-                raise _unsafe(rel, "the file is a symbolic link")
-            raise ReleaseSourceError("INPUT_UNREADABLE", f"{rel}: cannot open ({type(exc).__name__})")
-    finally:
-        os.close(fd)
-
-
-def _check_regular(fd: int, rel: str) -> None:
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode):
-        raise _unsafe(rel, "not a regular file")
-    if info.st_nlink != 1:
-        raise _unsafe(rel, "the file has more than one hard link")
-
-
 def _read(gitops_dir: Path, env: str) -> dict:
     files = {}
     for rel in sorted(allowed_paths(env)):
         try:
-            fd = _open_no_follow(gitops_dir, rel, os.O_RDONLY)
-        except FileNotFoundError:
-            continue  # absent (first run for release-source.yaml)
-        try:
-            _check_regular(fd, rel)
-            with os.fdopen(fd, "rb", closefd=False) as handle:
-                files[rel] = handle.read().decode("utf-8")
-        finally:
-            os.close(fd)
+            text = safe_fs.read_text(gitops_dir, rel)
+        except safe_fs.SafeFsError as exc:
+            raise ReleaseSourceError(exc.code, exc.message)
+        if text is not None:  # absent (first run for release-source.yaml)
+            files[rel] = text
     return files
 
 
@@ -286,26 +222,10 @@ def _write(gitops_dir: Path, plan: SourcePlan) -> None:
     for rel in plan.changed_paths:
         if rel not in allowed_paths(plan.env):
             raise ReleaseSourceError("ALLOWLIST_VIOLATION", f"refusing to write {rel}")
-        data = plan.new_files[rel].encode("utf-8")
         try:
-            fd = _open_no_follow(gitops_dir, rel, os.O_WRONLY | os.O_CREAT | os.O_EXCL)  # new file
-        except FileExistsError:
-            fd = _open_no_follow(gitops_dir, rel, os.O_WRONLY)  # existing: verified before truncating
-            try:
-                _check_regular(fd, rel)
-                os.ftruncate(fd, 0)
-            except BaseException:
-                os.close(fd)
-                raise
-        except FileNotFoundError:
-            raise ReleaseSourceError("INPUT_UNREADABLE", f"{rel}: parent directory does not exist")
-        try:
-            _check_regular(fd, rel)
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view):]
-        finally:
-            os.close(fd)
+            safe_fs.write_text(gitops_dir, rel, plan.new_files[rel])
+        except safe_fs.SafeFsError as exc:
+            raise ReleaseSourceError(exc.code, exc.message)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

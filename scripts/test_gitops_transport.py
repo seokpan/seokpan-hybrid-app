@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -441,6 +442,63 @@ class GitTests(GitFixture, unittest.TestCase):
         with self.assertRaises(writer.TransportError):
             tr.push_commit(BRANCH, self.base, {"releases/a.json": "{}"}, "  ")
         self.assertFalse(self.bare_has(BRANCH))
+
+
+@unittest.skipUnless(HAVE_GIT, "git is not installed")
+class SymlinkSafetyTests(GitFixture, unittest.TestCase):
+    """A tracked symlink / hard link in the checkout must not let the push path write outside it."""
+
+    def track(self, make) -> None:
+        """Commit something into main through a second clone (`make(seed_dir)`), then update the checkout."""
+        other = Path(self.tmp.name) / "seed2"
+        git("clone", str(self.bare), str(other), cwd=other.parent)
+        make(other)
+        git("add", "-A", cwd=other)
+        git("-c", "commit.gpgsign=false", "commit", "-m", "tracked", cwd=other)
+        git("push", "origin", "HEAD:refs/heads/main", cwd=other)
+        git("pull", "--ff-only", "origin", "main", cwd=self.checkout)
+        self.base = git("rev-parse", "HEAD", cwd=self.checkout)
+
+    def assert_refused(self, files: dict) -> None:
+        head = git("rev-parse", "HEAD", cwd=self.checkout)
+        with self.assertRaises(writer.TransportError) as ctx:
+            self.transport().push_commit(BRANCH, self.base, files, "m")
+        self.assertNotIn(TOKEN, str(ctx.exception))
+        self.assertIn("UNSAFE_PATH", str(ctx.exception))
+        self.assertFalse(self.bare_has(BRANCH))                                 # nothing pushed
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.checkout), head)    # checkout untouched
+        self.assertEqual(git("branch", "--list", BRANCH, cwd=self.checkout), "")
+        self.assertEqual(git("status", "--porcelain", cwd=self.checkout), "")
+
+    def test_tracked_directory_symlink_cannot_redirect_a_write(self) -> None:
+        ext = Path(self.tmp.name) / "ext"
+        ext.mkdir()
+        self.track(lambda seed: (seed / "releases").symlink_to(ext))
+        self.assert_refused({"releases/rel-x.json": "{}\n"})
+        self.assertEqual(list(ext.iterdir()), [])  # nothing was written outside the checkout
+
+    def test_tracked_file_symlink_cannot_redirect_a_write(self) -> None:
+        outside = Path(self.tmp.name) / "outside.yaml"
+        outside.write_text("OUTSIDE\n", encoding="utf-8")
+        path = gitops_planner.ENV_KUSTOMIZATION["recovery"]
+        self.track(lambda seed: ((seed / path).unlink(), (seed / path).symlink_to(outside)))
+        new_text = wx.fx.RECOVERY_KUST.replace(wx.fx.OLD_BE, wx.NEW_BE)
+        self.assert_refused({path: new_text, "releases/rel-x.json": "{}\n"})
+        self.assertEqual(outside.read_text(encoding="utf-8"), "OUTSIDE\n")
+
+    def test_hard_linked_target_file_is_refused_and_the_other_link_is_unchanged(self) -> None:
+        path = gitops_planner.ENV_KUSTOMIZATION["recovery"]
+        other_link = Path(self.tmp.name) / "other-link.yaml"
+        os.link(self.checkout / path, other_link)  # same inode, so git sees a clean tree
+        self.assertEqual(git("status", "--porcelain", cwd=self.checkout), "")
+        new_text = wx.fx.RECOVERY_KUST.replace(wx.fx.OLD_BE, wx.NEW_BE)
+        self.assert_refused({path: new_text})
+        self.assertEqual(other_link.read_text(encoding="utf-8"), wx.fx.RECOVERY_KUST)
+
+    def test_normal_checkout_still_works_after_the_safety_checks(self) -> None:
+        sha = self.transport().push_commit(BRANCH, self.base, {"releases/rel-x.json": "{}\n"}, "m")
+        self.assertEqual(git("rev-parse", BRANCH, cwd=self.bare), sha)
+        self.assertEqual(self.show(BRANCH, "releases/rel-x.json"), b"{}\n")
 
 
 class FakeGitHub:
