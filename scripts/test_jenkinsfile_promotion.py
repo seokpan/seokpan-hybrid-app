@@ -58,10 +58,20 @@ class PromotionStageTest(unittest.TestCase):
         self.assertEqual(TEXT.count("'hybrid-gitops-writer'"), 1)
         self.assertIn("GITOPS_WRITER_CRED", promo)
 
-    def test_plan_stage_has_no_credentials(self):
-        plan = block("stage('Promotion Plan (offline)')")
-        self.assertNotIn("withCredentials", plan)
-        self.assertIn("runPromotion('')", plan)
+    def test_no_plan_mode_and_no_network_when_off(self):
+        self.assertNotIn("'PLAN'", TEXT)
+        self.assertNotIn("Promotion Plan (offline)", TEXT)
+        prep = block("stage('Prepare (pinned SHA + Evidence)')")
+        self.assertNotIn("clone", prep)
+        self.assertNotIn("GITOPS_URL", prep)
+
+    def test_clone_only_in_remote_modes_without_credential(self):
+        self.assertEqual(TEXT.count("git -c credential.helper= clone"), 1)
+        clone = block("stage('Clone GitOps main (read-only, no credential)')")
+        self.assertIn("params.PROMOTION_MODE == 'REMOTE_CHECK' || params.PROMOTION_MODE == 'WRITE'", clone)
+        self.assertNotIn("withCredentials", clone)
+        self.assertNotIn("GH_TOKEN", clone)
+        self.assertLess(TEXT.index("stage('Clone GitOps main"), TEXT.index("stage('Promotion (credentialed)')"))
 
     def test_write_only_for_write_mode(self):
         self.assertEqual(TEXT.count("'--write'"), 1)
@@ -77,7 +87,6 @@ class PromotionStageTest(unittest.TestCase):
         self.assertNotIn("--env lab", TEXT)
         self.assertNotIn("--env cloud", TEXT)
         self.assertIn("https://github.com/seokpan/seokpan-hybrid-gitops.git", TEXT)
-        self.assertIn("git -c credential.helper= clone", TEXT)
 
     def test_failure_is_not_ignored(self):
         helper = block("def runPromotion")

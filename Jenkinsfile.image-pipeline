@@ -122,8 +122,8 @@ pipeline {
         )
         choice(
             name: 'PROMOTION_MODE',
-            choices: ['OFF', 'PLAN', 'REMOTE_CHECK', 'WRITE'],
-            description: 'GitOps Promotion (recovery). OFF=실행 안 함(기본), PLAN=오프라인 계획만(Credential 없음), REMOTE_CHECK=GitHub 읽기 전용 점검, WRITE=Promotion Branch push + PR 1건 생성.'
+            choices: ['OFF', 'REMOTE_CHECK', 'WRITE'],
+            description: 'GitOps Promotion (recovery). OFF=Promotion 실행 안 함(기본, Promotion용 GitHub clone/API 접근 없음. 기존 Image/P1 단계는 영향 없음), REMOTE_CHECK=GitOps clone + GitHub 읽기 전용 점검(push/PR 없음), WRITE=Promotion Branch push + PR 1건 생성. 네트워크 없는 pure plan은 Pipeline이 아니라 CLI(gitops_promote.py 기본 모드)로 로컬에서 실행한다.'
         )
     }
 
@@ -836,7 +836,8 @@ PYEOF
         // --------------------------------------------------------------
         // GitOps Promotion (recovery 전용, 기본 OFF).
         // Credential이 없는 app-ci-check Agent에서 실행한다 (Registry 쓰기 Credential 분리).
-        // hybrid-gitops-writer PAT는 PLAN 이외 모드의 python 실행 구간에만 주입한다.
+        // OFF에서는 GitHub 접근(clone/API)이 전혀 없다. clone은 REMOTE_CHECK부터 허용한다.
+        // hybrid-gitops-writer PAT는 REMOTE_CHECK/WRITE의 python 실행 구간에만 주입한다.
         // 결과는 PR 1건까지만 만든다. Merge는 사람이 Review 후 한다.
         // --------------------------------------------------------------
         stage('Promote GitOps (Recovery PR)') {
@@ -871,23 +872,24 @@ PYEOF
                                     set -eu
                                     git --version
                                     python3 --version
-                                    rm -rf .ci/gitops
-                                    mkdir -p .ci
-                                    git -c credential.helper= clone "$GITOPS_URL" .ci/gitops
-                                    test "$(git -C .ci/gitops remote get-url --push origin)" = "$GITOPS_URL"
                                 '''
                             }
                         }
                     }
                 }
 
-                stage('Promotion Plan (offline)') {
-                    when { expression { params.PROMOTION_MODE == 'PLAN' } }
+                // GitHub 접근은 REMOTE_CHECK/WRITE에서만 시작한다. Credential 없는 읽기 전용 clone.
+                stage('Clone GitOps main (read-only, no credential)') {
+                    when { expression { params.PROMOTION_MODE == 'REMOTE_CHECK' || params.PROMOTION_MODE == 'WRITE' } }
                     steps {
                         container('app-ci') {
-                            script {
-                                runPromotion('')
-                            }
+                            sh '''
+                                set -eu
+                                rm -rf .ci/gitops
+                                mkdir -p .ci
+                                git -c credential.helper= clone "$GITOPS_URL" .ci/gitops
+                                test "$(git -C .ci/gitops remote get-url --push origin)" = "$GITOPS_URL"
+                            '''
                         }
                     }
                 }
