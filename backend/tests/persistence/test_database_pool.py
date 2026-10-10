@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +15,18 @@ from seokpan.persistence.mariadb.connection import (
 )
 from seokpan.persistence.mariadb.settings import MigrationSettings
 from seokpan.settings import Settings
-from tests.persistence.test_database_connection import BASE, CA, MODULE, settings
+
+CA = Path(__file__).parent / "fixtures/public-ca.crt"
+MODULE = "seokpan.persistence.mariadb.connection"
+BASE = "mysql+asyncmy://identity_svc:synthetic-only@db.seokpan.soldesk.store:3306/stone_game"
+
+
+def settings() -> Settings:
+    return Settings(
+        identity_database_url=BASE,
+        game_database_url=BASE.replace("identity_svc", "game_svc"),
+        database_ca_file=str(CA),
+    )
 
 
 @pytest.fixture(autouse=True)
