@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 
 BOARD_SIZE = 15
 _COORDINATE_PATTERN = re.compile(r"([A-O])(1[0-5]|[1-9])")
@@ -160,11 +161,16 @@ class Game:
         )
 
     @classmethod
+    @lru_cache(maxsize=128)
     def black_forbidden_coordinates(
         cls,
         occupied_cells: tuple[BoardCell, ...],
     ) -> tuple[Coordinate, ...]:
-        """Calculate current black forbidden positions from a public board snapshot."""
+        """Reuse pure results for immutable boards, bounded to 128 snapshots.
+
+        Viewer permissions, votes and deadlines are projected separately on every
+        response. Authoritative move validation still checks the current board.
+        """
         board: dict[Coordinate, Stone] = {}
         for cell in occupied_cells:
             if cell.stone is Stone.EMPTY or cell.coordinate in board:
@@ -353,7 +359,11 @@ class Game:
         anchor: Coordinate,
         direction: tuple[int, int],
     ) -> bool:
-        for extension in cls._line_coordinates(anchor, direction):
+        coordinates = cls._line_coordinates(anchor, direction)
+        # One hypothetical extension cannot make five from fewer than four stones.
+        if sum(board.get(item, Stone.EMPTY) is Stone.BLACK for item in coordinates) < 4:
+            return False
+        for extension in coordinates:
             if board.get(extension, Stone.EMPTY) is not Stone.EMPTY:
                 continue
             future = dict(board)
@@ -370,7 +380,11 @@ class Game:
         anchor: Coordinate,
         direction: tuple[int, int],
     ) -> bool:
-        for extension in cls._line_coordinates(anchor, direction):
+        coordinates = cls._line_coordinates(anchor, direction)
+        # The open-four window needs four black stones after adding one extension.
+        if sum(board.get(item, Stone.EMPTY) is Stone.BLACK for item in coordinates) < 3:
+            return False
+        for extension in coordinates:
             if board.get(extension, Stone.EMPTY) is not Stone.EMPTY:
                 continue
             future = dict(board)
@@ -452,10 +466,12 @@ class Game:
         return tuple(reversed(before)) + (coordinate,) + tuple(after)
 
     @staticmethod
+    @lru_cache(maxsize=BOARD_SIZE * BOARD_SIZE * len(_DIRECTIONS))
     def _line_coordinates(
         coordinate: Coordinate,
         direction: tuple[int, int],
     ) -> tuple[Coordinate, ...]:
+        """Reuse immutable geometry, independent of any board's stones or actor."""
         delta_column, delta_row = direction
         column = coordinate.column
         row = coordinate.row
