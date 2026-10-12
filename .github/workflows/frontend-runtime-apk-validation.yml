@@ -1,0 +1,56 @@
+name: Frontend runtime apk version guard
+on:
+  pull_request:
+    branches: [main]
+    paths: ['frontend/Dockerfile', '.github/workflows/frontend-runtime-apk-validation.yml']
+  push:
+    branches: [main]
+    paths: ['frontend/Dockerfile', '.github/workflows/frontend-runtime-apk-validation.yml']
+permissions:
+  contents: read
+jobs:
+  apk-version-guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build only the actual pinned runtime package layer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          source = Path("frontend/Dockerfile").read_text()
+          runtime = re.search(r"^FROM ([^\s]+@sha256:[a-f0-9]{64}) AS runtime$", source, re.M)
+          if runtime is None:
+              raise SystemExit("Pinned runtime stage missing")
+          tail = source[runtime.end():]
+          package = re.search(r"^USER root\n(RUN apk update.*?)(?=^USER 101$)", tail, re.M | re.S)
+          if package is None:
+              raise SystemExit("Runtime package stage/USER restoration changed")
+          output = Path(os.environ["RUNNER_TEMP"]) / "apk-guard.Dockerfile"
+          output.write_text("FROM " + runtime[1] + "\nUSER root\n" + package[1] + "USER 101\n")
+          print("runtime_base=" + runtime[1])
+          PY
+          docker build --progress=plain -f "$RUNNER_TEMP/apk-guard.Dockerfile" -t "seokpan-apk-guard:$GITHUB_RUN_ID" "$RUNNER_TEMP"
+      - name: Assert real apk accepts patched tiff and rejects an impossible version
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --user root --entrypoint sh "seokpan-apk-guard:$GITHUB_RUN_ID" -c '
+            set -eu
+            apk info -v tiff
+            set +e
+            apk info --exists "tiff>=4.7.2-r0"
+            ok=$?
+            apk info --exists "tiff>=99"
+            neg=$?
+            set -e
+            printf "ok=%s neg=%s\n" "$ok" "$neg"
+            test "$ok" -eq 0
+            test "$neg" -eq 1
+          '
