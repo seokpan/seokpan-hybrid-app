@@ -69,10 +69,12 @@ FROM nginxinc/nginx-unprivileged:1.30.4-alpine3.24@sha256:9b87ad3dd9f431c733f19d
 # CVE-2026-93990(fixed=2.8.5-r0)도 같은 Alpine v3.24 Repository에서 패치.
 # [추가, 2026-10-02] main Image #37에서 검출된 pcre2 HIGH
 # CVE-2026-103111(fixed=10.49-r0)도 같은 Alpine v3.24 Repository에서 패치.
+# CVE-2026-4775: tiff 수정 버전 4.7.2-r0 이상이 설치됐는지 빌드에서 확인.
 # apk 명령 실행을 위해 잠깐 root로 전환 후 즉시 원래 non-root(101)로 복귀.
 USER root
 RUN apk update && \
-    apk upgrade --no-cache libuuid libexpat pcre2 && \
+    apk upgrade --no-cache libuuid libexpat pcre2 tiff && \
+    apk info --exists 'tiff>=4.7.2-r0' && \
     rm -rf /var/cache/apk/*
 USER 101
 
