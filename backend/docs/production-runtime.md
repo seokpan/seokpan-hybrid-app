@@ -18,6 +18,33 @@ Production의 필수 설정 이름은 다음과 같습니다.
 
 정상 Backend는 `db_admin` Migration Credential을 사용하지 않습니다. URL·CA·Credential 값은 Kubernetes Secret/ConfigMap과 Mount로만 공급하고 로그·문서·Git에 남기지 않습니다.
 
+## Runtime DB Pool의 명시적 입력
+
+Pool 값을 채택하기 전에 외부 입력을 연결할 Source 경로를 준비했다. 다음 세
+설정은 모두 미지정이 기본이며, 미지정이면 기존 SQLAlchemy 생성 옵션을 유지한다.
+
+- `SEOKPAN_DATABASE_POOL_SIZE`: Engine당 양의 정수
+- `SEOKPAN_DATABASE_MAX_OVERFLOW`: Engine당 0 이상의 정수
+- `SEOKPAN_DATABASE_POOL_TIMEOUT_SECONDS`: Pool checkout 대기 시간, 유한한 양수(초)
+
+하나라도 사용할 때는 세 항목을 함께 공급한다. Runtime의 Identity/Game 두
+Engine에 각각 같은 값을 적용하며 Process마다 Engine 쌍이 생성된다. Pod당 또는
+전체 DB당 수치로 읽지 않는다. Pool size 0(무제한 크기), overflow -1(무제한
+overflow), 부분 입력·bool·잘못된 숫자·NaN/Infinity는 거부한다. Migration의
+별도 설정과 NullPool에는 이 입력을 적용하지 않는다. TLS·계정·pre-ping·정상/실패
+종료의 Engine 회수 경계를 유지한다.
+
+필드는 운영값 채택 또는 Cloud 활성화 승인이 아니다. C의 실측 연결 상한과 예약,
+실제 Process·Replica·Surge·종료 중 연결을 가진 Pod 수, timeout/부하·재접속
+기준을 B/C가 대조한 뒤 값과 실행 범위를 정한다. 기존 3+2/60 후보를 기본값으로
+넣지 않았으며 pool_recycle도 임의로 도입하지 않았다. 현재 GitOps 환경변수·Image·
+Replica는 변경하지 않는다. 채택 후에는 새 App Source의 Build/Scan/Smoke·Digest와
+GitOps 입력 연결을 거쳐 실제 DB 연결·대기·롤링·종료/재접속을 확인한다.
+
+SQLAlchemy는 checkout 시점에 연결을 만들므로 생성자·가짜 연결을 사용하는 Pool
+시험은 실제 RDS 접속·성능 시험이 아니다. 구현 기준은 고정 SQLAlchemy 2.0.52와
+[공식 Pool 문서](https://docs.sqlalchemy.org/en/20/core/pooling.html)다.
+
 ## 시작·준비·종료
 
 시작 순서는 역할별 MariaDB Engine → Redis Client → 두 DB의 `SELECT 1` → Redis `PING` → 전체 Service/Runner 조립입니다. 필수 Runner가 첫 반복을 정상 완료한 뒤에만 `/health/ready`를 200으로 엽니다. 설정 오류, Provider 연결 실패 또는 Runner 조기 종료는 준비 완료로 오인하지 않습니다.

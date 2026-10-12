@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qsl, urlsplit
 
+from pydantic import ValidationError
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
@@ -23,6 +24,7 @@ from sqlalchemy.pool import NullPool
 
 from seokpan.connection_contract import ConnectionContractError, DatabaseTarget
 from seokpan.connection_settings import DatabaseTargetSettings
+from seokpan.database_pool import RuntimePoolOptions
 from seokpan.persistence.mariadb.settings import MigrationSettings
 from seokpan.settings import Settings
 
@@ -107,7 +109,13 @@ def database_ssl_context(ca_file: str | None) -> ssl.SSLContext:
         raise DatabaseConfigurationError("database CA file is unreadable or invalid") from None
 
 
-def _engine(url: URL, context: ssl.SSLContext, *, migration: bool) -> AsyncEngine:
+def _engine(
+    url: URL,
+    context: ssl.SSLContext,
+    *,
+    migration: bool,
+    pool_options: dict[str, int | float] | None = None,
+) -> AsyncEngine:
     try:
         if migration:
             return create_async_engine(
@@ -121,6 +129,7 @@ def _engine(url: URL, context: ssl.SSLContext, *, migration: bool) -> AsyncEngin
             connect_args={"ssl": context},
             pool_pre_ping=True,
             hide_parameters=True,
+            **(pool_options or {}),
         )
     except (ValueError, TypeError, SQLAlchemyError):
         raise DatabaseConfigurationError("database engine configuration failed") from None
@@ -145,14 +154,23 @@ class RuntimeDatabases:
 
 @asynccontextmanager
 async def runtime_databases(settings: Settings) -> AsyncIterator[RuntimeDatabases]:
+    try:
+        # Revalidate mutable Settings before any Engine/TLS construction as well.
+        pool_options = RuntimePoolOptions(
+            database_pool_size=settings.database_pool_size,
+            database_max_overflow=settings.database_max_overflow,
+            database_pool_timeout_seconds=settings.database_pool_timeout_seconds,
+        ).engine_options()
+    except ValidationError:
+        raise DatabaseConfigurationError("database pool configuration is invalid") from None
     target = configured_database_target(settings)
     identity_url = validated_database_url(settings.identity_database_url, "identity_svc", target)
     game_url = validated_database_url(settings.game_database_url, "game_svc", target)
     context = database_ssl_context(settings.database_ca_file)
     async with AsyncExitStack() as cleanup:
-        identity = _engine(identity_url, context, migration=False)
+        identity = _engine(identity_url, context, migration=False, pool_options=pool_options)
         cleanup.push_async_callback(identity.dispose)
-        game = _engine(game_url, context, migration=False)
+        game = _engine(game_url, context, migration=False, pool_options=pool_options)
         cleanup.push_async_callback(game.dispose)
         yield RuntimeDatabases(
             identity,

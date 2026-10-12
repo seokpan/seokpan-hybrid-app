@@ -2,10 +2,10 @@ from typing import Literal
 
 from pydantic import Field
 
-from seokpan.connection_settings import DatabaseTargetSettings
+from seokpan.database_pool import RuntimePoolInputs
 
 
-class Settings(DatabaseTargetSettings):
+class Settings(RuntimePoolInputs):
     environment: Literal["local", "test", "development", "production"] = "local"
     # Switch only after the captured-lifecycle rollout gates; never per request.
     game_lifecycle_mode: Literal["legacy", "captured"] = "legacy"
