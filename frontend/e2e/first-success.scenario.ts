@@ -155,6 +155,36 @@ export async function firstSuccessScenario(
   );
   const [black, white, guest] = await Promise.all(contexts.map((context) => context.newPage()));
   const pages = [black, white, guest];
+  const roomFrames = [0, 0, 0];
+  let wrongSocketOrigin = false;
+  if (shared) {
+    const target = new URL(baseURL!);
+    pages.forEach((page, index) =>
+      page.on("websocket", (socket) => {
+        const address = new URL(socket.url());
+        if (!/^\/ws\/v1\/rooms\/[A-Za-z0-9_-]+$/.test(address.pathname)) return;
+        if (
+          address.host !== target.host ||
+          address.protocol !== (target.protocol === "https:" ? "wss:" : "ws:")
+        )
+          wrongSocketOrigin = true;
+        socket.on("framereceived", ({ payload }) => {
+          try {
+            const message = JSON.parse(String(payload));
+            if (
+              message.schema_version === 1 &&
+              Number.isSafeInteger(message.state_version) &&
+              message.state_version > 0 &&
+              message.room_id === address.pathname.split("/").at(-1)
+            )
+              roomFrames[index] += 1;
+          } catch {
+            /* No payload retention; absence of valid frames fails below. */
+          }
+        });
+      }),
+    );
+  }
   pages.forEach((page) => {
     page.setDefaultTimeout(10_000);
     page.setDefaultNavigationTimeout(15_000);
@@ -378,6 +408,17 @@ export async function firstSuccessScenario(
       await expect(guest.getByText("아직 열린 방이 없습니다.", { exact: true })).toBeVisible();
     }
     expect(pageErrors).toBe(0);
+    if (shared) {
+      expect(wrongSocketOrigin).toBe(false);
+      expect(roomFrames.every((count) => count > 0)).toBe(true);
+      await info.attach("functional-room-transport", {
+        contentType: "application/json",
+        body: JSON.stringify({
+          valid_room_frames_per_client: roomFrames,
+          scope: "FUNCTIONAL_TRANSPORT_ONLY_NOT_LATENCY_OR_LOAD",
+        }),
+      });
+    }
   } finally {
     await Promise.all(contexts.map((context) => context.close()));
   }
