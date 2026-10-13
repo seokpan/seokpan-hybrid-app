@@ -1,0 +1,48 @@
+name: External Browser Source and local shared fixture
+on:
+  pull_request:
+    branches: [main]
+    paths: ['frontend/**', '.github/workflows/external-browser-source-validation.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.19.0'
+      - name: Prepare pinned local test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global npm@12.0.2
+          python3 -m pip install --quiet --target "$RUNNER_TEMP/pinned-uv" uv==0.12.5
+          "$RUNNER_TEMP/pinned-uv/bin/uv" python install 3.13.15
+          (cd backend && "$RUNNER_TEMP/pinned-uv/bin/uv" sync --frozen --python 3.13.15)
+          (cd frontend && npm ci && npm run e2e:install)
+      - name: Check Source and external list without target access
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run format:check
+          npm run lint
+          npm run typecheck
+          npm run test:tooling
+          SEOKPAN_EXTERNAL_TARGET=https://example.test SEOKPAN_EXTERNAL_RUN_ID=source-list npm run e2e:external -- --list
+      - name: Owned local Memory shared-environment assertions
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PLAYWRIGHT_BROWSERS_PATH="$PWD/.browser-cache"
+          node node_modules/@playwright/test/cli.js test --config playwright.external-fixture.config.ts
+          git diff --exit-code
+          printf 'Scope: Source and owned local Memory only. OCP/SQL/Redis/performance NOT RUN.\n' >> "$GITHUB_STEP_SUMMARY"
