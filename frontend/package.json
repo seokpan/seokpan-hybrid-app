@@ -20,7 +20,8 @@
     "typecheck": "tsc -b --pretty false",
     "e2e:install": "node scripts/browser-e2e.mjs install",
     "e2e:ci": "node scripts/browser-ci.mjs",
-    "e2e": "node scripts/browser-e2e.mjs test"
+    "e2e": "node scripts/browser-e2e.mjs test",
+    "e2e:external": "node scripts/external-browser.mjs"
   },
   "dependencies": {
     "react": "19.2.8",
