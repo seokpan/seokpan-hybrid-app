@@ -266,8 +266,22 @@ def _verify_minimal_edit(path: str, old: Sequence[str], new: Sequence[str], expe
 
 # ---------------------------------------------------------------- allowlist
 
+# release-source annotations (hybrid-app #50): only recovery and cloud, never lab. The path is derived from
+# the overlay's kustomization directory, so Cloud's `runtime/` layout needs no special case.
+SOURCE_FILE = "release-source.yaml"
+SOURCE_ENVS = ("recovery", "cloud")
+
+
+def source_path(env: str) -> str:
+    if env not in SOURCE_ENVS:
+        raise PlanError("SOURCE_ENV_UNSUPPORTED", f"release-source is not supported for env '{env}'")
+    return ENV_KUSTOMIZATION[env].rsplit("/", 1)[0] + "/" + SOURCE_FILE
+
+
 def allowed_paths(env: str, components: Iterable[str]) -> set:
     paths = {ENV_KUSTOMIZATION[env]}
+    if env in SOURCE_ENVS:
+        paths.add(source_path(env))
     if env == "lab" and "backend" in set(components):
         paths.add(MIGRATION_PATH)
     return paths

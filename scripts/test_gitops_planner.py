@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/07
+# 수정 날짜: 2026/10/14 (Recovery FE/BE 동시 갱신 거부, release-source 허용 경로 시험)
 """Unit tests for scripts/gitops_planner.py (hybrid-app #15, pure planner)."""
 
 from __future__ import annotations
@@ -364,6 +365,33 @@ class AllowlistTests(unittest.TestCase):
             target.check_allowlist([target.MIGRATION_PATH], "lab", ["frontend"])
         with self.assertRaises(target.PlanError):
             target.check_allowlist([target.MIGRATION_PATH], "recovery", ["backend"])
+
+    def test_release_source_paths_are_derived_per_env(self) -> None:
+        self.assertEqual(target.source_path("recovery"), "apps/overlays/recovery/release-source.yaml")
+        self.assertEqual(target.source_path("cloud"), "apps/overlays/cloud/runtime/release-source.yaml")
+
+    def test_release_source_is_allowed_for_recovery_and_cloud(self) -> None:
+        for env in ("recovery", "cloud"):
+            with self.subTest(env=env):
+                target.check_allowlist(
+                    [target.ENV_KUSTOMIZATION[env], target.source_path(env)], env, ["backend", "frontend"]
+                )
+
+    def test_release_source_is_not_allowed_for_lab_or_for_another_env(self) -> None:
+        with self.assertRaises(target.PlanError) as cm:
+            target.check_allowlist([target.source_path("recovery").replace("recovery", "lab")], "lab", ["backend"])
+        self.assertEqual(cm.exception.code, "ALLOWLIST_VIOLATION")
+        with self.assertRaises(target.PlanError) as cm:
+            target.check_allowlist([target.source_path("cloud")], "recovery", ["backend", "frontend"])
+        self.assertEqual(cm.exception.code, "ALLOWLIST_VIOLATION")
+        with self.assertRaises(target.PlanError) as cm:
+            target.check_allowlist([target.source_path("recovery")], "cloud", ["backend", "frontend"])
+        self.assertEqual(cm.exception.code, "ALLOWLIST_VIOLATION")
+
+    def test_source_path_rejects_lab(self) -> None:
+        with self.assertRaises(target.PlanError) as cm:
+            target.source_path("lab")
+        self.assertEqual(cm.exception.code, "SOURCE_ENV_UNSUPPORTED")
 
     def test_forbidden_paths(self) -> None:
         for path in (
