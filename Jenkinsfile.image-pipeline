@@ -116,7 +116,7 @@ def runPromotion(String promotionEnv, String modeFlag, String baseSha) {
     }
     def rc = sh(
         returnStatus: true,
-        script: "python3 scripts/gitops_promote.py --env ${promotionEnv} --metadata image-metadata.json --gitops-dir .ci/gitops --expected-base-sha ${baseSha} ${modeFlag} > ${resultFile} 2>&1" 
+        script: "python3 scripts/gitops_promote.py --env ${promotionEnv} --metadata image-metadata.json --gitops-dir .ci/gitops --expected-base-sha ${baseSha} ${modeFlag} > ${resultFile} 2>&1"
     )
     echo readFile(resultFile)
     if (rc != 0) {
