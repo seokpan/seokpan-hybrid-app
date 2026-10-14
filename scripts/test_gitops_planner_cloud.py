@@ -15,6 +15,8 @@ RECOVERY_PATH = "apps/overlays/recovery/kustomization.yaml"
 HOST = "847835841591.dkr.ecr.ap-northeast-2.amazonaws.com"
 SHA = "0829a24364832014b9a1ad600afd3211d6e261ca"
 PLACEHOLDER = "INPUT_REQUIRED"
+OTHER_ACCOUNT_HOST = "999999999999.dkr.ecr.ap-northeast-2.amazonaws.com"
+OTHER_REGION_HOST = "847835841591.dkr.ecr.us-east-1.amazonaws.com"
 ECR = {"backend": "sha256:" + "a" * 64, "frontend": "sha256:" + "b" * 64}
 HARBOR = {"backend": "sha256:" + "c" * 64, "frontend": "sha256:" + "d" * 64}
 OLD = {"backend": "sha256:" + "1" * 64, "frontend": "sha256:" + "2" * 64}
@@ -90,27 +92,50 @@ class CloudPlanner(unittest.TestCase):
         self.assertEqual(plan(overlay(OLD["backend"], OLD["frontend"])).status, "CHANGES")
         self.assertEqual(plan(overlay(ECR["backend"], ECR["frontend"])).status, "NO_CHANGE")
 
-    def test_component_subset_leaves_the_other_line_alone(self):
-        result = plan(overlay(), components=("backend",))
-        self.assertEqual([c.component for c in result.image_changes], ["backend"])
-        self.assertIn("digest: " + PLACEHOLDER, result.new_files[CLOUD_PATH])
+    def test_single_component_cloud_promotion_is_rejected(self):
+        for components in (("backend",), ("frontend",)):
+            with self.subTest(components=components), self.assertRaises(PlanError) as cm:
+                plan(overlay(), components=components)
+            self.assertEqual(cm.exception.code, "CLOUD_COMPONENTS_REQUIRED")
+
+    def test_single_component_is_rejected_even_when_both_digests_are_already_filled(self):
+        # Updating one side of a filled overlay would mix two releases (GitOps validate rejects it).
+        with self.assertRaises(PlanError) as cm:
+            plan(overlay(OLD["backend"], OLD["frontend"]), components=("backend",))
+        self.assertEqual(cm.exception.code, "CLOUD_COMPONENTS_REQUIRED")
+
+    def test_single_component_without_ecr_metadata_still_changes_nothing(self):
+        result = plan_promotion(metadata(ecr=False), "cloud", ("backend",), {})
+        self.assertEqual(result.status, "NO_CHANGE")
 
     def test_metadata_without_ecr_never_touches_cloud(self):
         result = plan_promotion(metadata(ecr=False), "cloud", ("backend", "frontend"), {})
         self.assertEqual(result.status, "NO_CHANGE")
         self.assertTrue(any("CLOUD_UNCHANGED" in note for note in result.notes))
 
-    def test_wrong_registry_or_repository_is_rejected(self):
-        bad_names = (
-            "harbor.seokpan.soldesk.store/seokpan-hybrid/backend",
-            "ecr-input-required.invalid/seokpan-fnd-backend",
-            HOST + "/seokpan-fnd-frontend",              # frontend repository on the backend entry
-            "999999999999.dkr.ecr.ap-northeast-2.amazonaws.com/seokpan-fnd-backend-x",
-        )
-        for name in bad_names:
-            with self.subTest(newName=name), self.assertRaises(PlanError) as cm:
+    def test_only_the_approved_full_ecr_uri_is_accepted(self):
+        bad_names = {
+            "harbor registry": "harbor.seokpan.soldesk.store/seokpan-hybrid/backend",
+            "old placeholder host": "ecr-input-required.invalid/seokpan-fnd-backend",
+            "frontend repository on the backend entry": HOST + "/seokpan-fnd-frontend",
+            "repository suffix": HOST + "/seokpan-fnd-backend-x",
+            "same repository, other account": OTHER_ACCOUNT_HOST + "/seokpan-fnd-backend",
+            "same repository, other region": OTHER_REGION_HOST + "/seokpan-fnd-backend",
+        }
+        for label, name in bad_names.items():
+            with self.subTest(case=label), self.assertRaises(PlanError) as cm:
                 plan(overlay(backend_name=name))
             self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
+        with self.subTest(case="frontend, other account"), self.assertRaises(PlanError) as cm:
+            plan(overlay(frontend_name=OTHER_ACCOUNT_HOST + "/seokpan-fnd-frontend"))
+        self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
+
+    def test_metadata_ecr_repository_must_match_the_approved_repository(self):
+        meta = metadata()
+        meta["components"]["backend"]["ecr"]["repository"] = "seokpan-fnd-other"
+        with self.assertRaises(PlanError) as cm:
+            plan_promotion(meta, "cloud", ("backend", "frontend"), {CLOUD_PATH: overlay()})
+        self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
 
     def test_old_new_tag_entry_and_misspelled_placeholder_are_rejected(self):
         old_format = overlay().replace("    digest: INPUT_REQUIRED", "    newTag: INPUT_REQUIRED", 1)

@@ -328,15 +328,18 @@ def _repo_matches(new_name: str, repository: str) -> bool:
     return new_name == repository or new_name.endswith("/" + repository)
 
 
-_ECR_NEWNAME_RE = re.compile(
-    r"^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/(?P<repo>[a-z0-9][a-z0-9._/-]*)$"
-)
+# Approved Cloud newName values (team decision 2026-10-13, hybrid-app#47). Account, region and
+# repository are all fixed: the same repository path under another account or region is rejected.
+CLOUD_NEWNAME = {
+    "backend": "847835841591.dkr.ecr.ap-northeast-2.amazonaws.com/seokpan-fnd-backend",
+    "frontend": "847835841591.dkr.ecr.ap-northeast-2.amazonaws.com/seokpan-fnd-frontend",
+}
 
 
-def _ecr_repo_matches(new_name: str, repository: str) -> bool:
-    """Cloud newName must be a real ECR registry host plus exactly the metadata repository."""
-    match = _ECR_NEWNAME_RE.match(new_name)
-    return match is not None and match.group("repo") == repository
+def _cloud_target_matches(new_name: str, component: str, metadata_repository: str) -> bool:
+    """newName must equal the approved full URI and its repository must be the metadata's ECR repository."""
+    approved = CLOUD_NEWNAME[component]
+    return new_name == approved and approved.split("/", 1)[1] == metadata_repository
 
 
 # ---------------------------------------------------------------- plan
@@ -398,6 +401,13 @@ def plan_promotion(
             env, selected, parsed.app_sha, (), {}, {},
             ("CLOUD_UNCHANGED: ECR metadata absent (Harbor digest is never copied to Cloud)",),
         )
+    if env == "cloud" and set(selected) != set(COMPONENTS):
+        # The merged GitOps Cloud check accepts only both placeholders or both digests of ONE
+        # release candidate, so a partial Cloud promotion would fail validate (hybrid-app#48 review).
+        raise PlanError(
+            "CLOUD_COMPONENTS_REQUIRED",
+            "Cloud backend and frontend digests are promoted together from one release candidate; select both components",
+        )
 
     path = ENV_KUSTOMIZATION[env]
     text = files.get(path)
@@ -422,8 +432,12 @@ def plan_promotion(
             ecr = parsed.components[comp].ecr
             if ecr is None:
                 raise PlanError("CLOUD_ECR_MISSING", f"{comp}: ECR image is required for Cloud")
-            if not _ecr_repo_matches(ref.new_name, ecr.repository):
-                raise PlanError("NEWNAME_MISMATCH", f"{path}: '{ref.name}' newName does not match the ECR repository")
+            if not _cloud_target_matches(ref.new_name, comp, ecr.repository):
+                raise PlanError(
+                    "NEWNAME_MISMATCH",
+                    f"{path}: '{ref.name}' newName is not the approved Cloud ECR repository "
+                    "(account, region and repository are fixed)",
+                )
             digest = ecr.digest  # never the Harbor digest
         else:
             repository, digest, note = _lab_target(lab_mapping, comp, harbor)
