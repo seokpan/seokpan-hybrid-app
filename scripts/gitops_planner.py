@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/07
 # 수정 날짜: 2026-10-13 (Cloud ECR digest 갱신)
+# 수정 날짜: 2026-10-14 (Recovery FE/BE 동시 갱신 필수, release-source 허용 경로)
 """hybrid-gitops Image Promotion pure planner (hybrid-app #15).
 
 입력(image-metadata.json 내용 + 로컬 checkout 파일 내용)만으로 선택 환경의 FE/BE Image
@@ -407,6 +408,14 @@ def plan_promotion(
         raise PlanError(
             "CLOUD_COMPONENTS_REQUIRED",
             "Cloud backend and frontend digests are promoted together from one release candidate; select both components",
+        )
+
+    if env == "recovery" and set(selected) != set(COMPONENTS):
+        # Candidate JSON always records both Digests, so a partial Recovery promotion would leave the
+        # overlay and the candidate out of sync (release-source check and GitOps F4 test need both).
+        raise PlanError(
+            "RECOVERY_COMPONENTS_REQUIRED",
+            "Recovery backend and frontend digests are promoted together from one release candidate; select both components",
         )
 
     path = ENV_KUSTOMIZATION[env]

@@ -142,16 +142,24 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(r.new_files[path], RECOVERY_KUST.replace(OLD_BE, H_BE).replace(OLD_FE, H_FE))
         self.assertIn("newTag: INPUT_REQUIRED", r.new_files[path])  # valkey/redis untouched
 
-    def test_frontend_only(self) -> None:
-        r = target.plan_promotion(metadata(), "recovery", ["frontend"], self.files())
-        text = r.new_files[target.ENV_KUSTOMIZATION["recovery"]]
-        self.assertIn(OLD_BE, text)
-        self.assertIn(H_FE, text)
-        self.assertEqual([c.component for c in r.image_changes], ["frontend"])
+    def test_partial_recovery_is_rejected(self) -> None:
+        # The candidate always records both Digests, so FE-only / BE-only would desync overlay and candidate.
+        for comps in (["frontend"], ["backend"]):
+            with self.subTest(components=comps):
+                with self.assertRaises(target.PlanError) as cm:
+                    target.plan_promotion(metadata(), "recovery", comps, self.files())
+                self.assertEqual(cm.exception.code, "RECOVERY_COMPONENTS_REQUIRED")
 
-    def test_backend_only_does_not_touch_migration(self) -> None:
-        r = target.plan_promotion(metadata(), "recovery", ["backend"], self.files())
-        self.assertEqual(set(r.new_files), {target.ENV_KUSTOMIZATION["recovery"]})
+    def test_partial_recovery_is_rejected_before_any_file_is_needed(self) -> None:
+        with self.assertRaises(target.PlanError) as cm:
+            target.plan_promotion(metadata(), "recovery", ["backend"], {})
+        self.assertEqual(cm.exception.code, "RECOVERY_COMPONENTS_REQUIRED")
+
+    def test_lab_partial_is_not_affected_by_the_recovery_rule(self) -> None:
+        # lab keeps accepting a single component: it fails later on the missing file, not on the new rule.
+        with self.assertRaises(target.PlanError) as cm:
+            target.plan_promotion(metadata(), "lab", ["backend"], {}, lab_mapping())
+        self.assertEqual(cm.exception.code, "FILE_MISSING")
 
     def test_no_change_when_identical(self) -> None:
         text = RECOVERY_KUST.replace(OLD_BE, H_BE).replace(OLD_FE, H_FE)
@@ -164,7 +172,9 @@ class RecoveryTests(unittest.TestCase):
     def test_newname_mismatch_fails(self) -> None:
         text = RECOVERY_KUST.replace("seokpan-hybrid/backend", "other/backend")
         with self.assertRaises(target.PlanError) as ctx:
-            target.plan_promotion(metadata(), "recovery", ["backend"], {target.ENV_KUSTOMIZATION["recovery"]: text})
+            target.plan_promotion(
+                metadata(), "recovery", ["backend", "frontend"], {target.ENV_KUSTOMIZATION["recovery"]: text}
+            )
         self.assertEqual(ctx.exception.code, "NEWNAME_MISMATCH")
 
     def test_crlf_and_missing_trailing_newline_preserved(self) -> None:
@@ -249,7 +259,9 @@ class LabTests(unittest.TestCase):
 
 class EntryParsingTests(unittest.TestCase):
     def plan(self, text: str):
-        return target.plan_promotion(metadata(), "recovery", ["backend"], {target.ENV_KUSTOMIZATION["recovery"]: text})
+        return target.plan_promotion(
+            metadata(), "recovery", ["backend", "frontend"], {target.ENV_KUSTOMIZATION["recovery"]: text}
+        )
 
     def test_missing_entry(self) -> None:
         with self.assertRaises(target.PlanError) as ctx:
@@ -279,7 +291,7 @@ class EntryParsingTests(unittest.TestCase):
 
     def test_missing_file_content(self) -> None:
         with self.assertRaises(target.PlanError) as ctx:
-            target.plan_promotion(metadata(), "recovery", ["backend"], {})
+            target.plan_promotion(metadata(), "recovery", ["backend", "frontend"], {})
         self.assertEqual(ctx.exception.code, "FILE_MISSING")
 
 
@@ -383,7 +395,9 @@ class PurityTests(unittest.TestCase):
     def test_inputs_not_mutated(self) -> None:
         meta = metadata()
         snapshot = copy.deepcopy(meta)
-        target.plan_promotion(meta, "recovery", ["backend"], {target.ENV_KUSTOMIZATION["recovery"]: RECOVERY_KUST})
+        target.plan_promotion(
+            meta, "recovery", ["backend", "frontend"], {target.ENV_KUSTOMIZATION["recovery"]: RECOVERY_KUST}
+        )
         self.assertEqual(meta, snapshot)
 
 
