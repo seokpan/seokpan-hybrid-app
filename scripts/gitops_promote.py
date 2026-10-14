@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
+# 수정 날짜: 2026/10/14 (Recovery·Cloud Promotion에 release-source 출처 주석을 같은 PR로 포함)
 """Promotion entry point: planner -> release candidate -> writer -> GitHub transport (hybrid-app #15).
 
 Modes (nothing is written unless `--write` is given):
@@ -30,6 +31,7 @@ import gitops_planner  # noqa: E402
 import gitops_transport  # noqa: E402
 import gitops_writer  # noqa: E402
 import release_candidate  # noqa: E402
+import release_source  # noqa: E402
 
 SHA_RE = gitops_writer.SHA_RE
 
@@ -108,6 +110,9 @@ def run(
         release_candidate.validate_release_id(release_id, args.env, plan.app_sha)
         candidate = release_candidate.build_candidate(meta, args.env, release_id, infra_sha=args.infra_sha)
         candidate_text = release_candidate.render_json(candidate)
+        # Recovery/Cloud: the release-source annotation travels in the SAME Promotion PR/commit, checked against
+        # the digests this very plan writes (lab and NO_CHANGE are untouched). Offline, so PLAN_ONLY shows it too.
+        plan = release_source.attach_to_plan(plan, candidate_text, files)
         print(f"PROMOTION_RELEASE_ID={release_id}")
         print(f"PROMOTION_BRANCH={gitops_writer.branch_name(release_id)}")
         print(f"PROMOTION_BASE_SHA={base_sha}")
@@ -123,7 +128,7 @@ def run(
             transport, plan, meta, release_id, candidate_text, base_sha, write=args.write
         )
     except (PromoteError, gitops_planner.PlanError, release_candidate.ReleaseError,
-            gitops_writer.WriterError, gitops_writer.TransportError) as exc:
+            release_source.ReleaseSourceError, gitops_writer.WriterError, gitops_writer.TransportError) as exc:
         print(f"PROMOTION_ERROR: {gitops_writer.redact(exc)}", file=sys.stderr)  # message already starts with its code
         return 2
 

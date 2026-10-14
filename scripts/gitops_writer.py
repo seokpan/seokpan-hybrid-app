@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
+# 수정 날짜: 2026/10/14 (PR 본문에 release-source 출처 주석 포함 안내)
 """hybrid-gitops Promotion Writer adapter (hybrid-app #15, mock-first).
 
 planner(gitops_planner)가 계산한 변경안과 Release 후보(release_candidate)를 받아
@@ -187,6 +188,14 @@ def build_pr_text(
             "- 변경 파일:",
             *[f"  - {path}" for path in files],
             f"- Release 후보 `{release_path(release_id)}`는 INCOMPLETE이며 미수신 값은 null / NOT RUN입니다.",
+            *(
+                [
+                    "- release-source 출처 주석(App SHA, Release ID)이 같은 PR에 포함됩니다. "
+                    "Deployment metadata annotation만 추가하며 Pod template은 바꾸지 않아 롤아웃이 없습니다."
+                ]
+                if gitops_planner.SOURCE_FILE in " ".join(files)
+                else []
+            ),
             "## 관련 Issue",
             f"- {ISSUE_REF}",
             "## 검증",
