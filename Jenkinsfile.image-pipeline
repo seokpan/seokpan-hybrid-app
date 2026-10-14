@@ -1,6 +1,7 @@
 // 작성자: 최유준
 // 작성 날짜: 2026-10-06
 // 수정 날짜: 2026-10-08 (Promotion Stage 추가, 기본 OFF)
+// 수정 날짜: 2026-10-14 (Promotion에 Cloud 환경 추가, ENABLE_ECR 기본값 true)
 //
 // ============================================================================
 // seokpan-hybrid-app :: main Image Pipeline (ECR Primary + Harbor Recovery)
@@ -13,7 +14,7 @@
 //   D  버전 고정 aws-cli Container를 이 Jenkinsfile의 inline Pod에 추가
 //      (1차 공유 Pod Template은 수정하지 않는다)
 //   E  2차 전용 Jenkins Folder 범위 Credential (등록 방식은 실측 후 확정)
-//   F  GitOps Writer PAT는 별도 Stage 범위. 'Promote GitOps (Recovery PR)' Stage 안에서만
+//   F  GitOps Writer PAT는 별도 Stage 범위. 'Promote GitOps (Recovery + Cloud PR)' Stage 안에서만
 //      withCredentials로 주입하며, 이미지 Build/Push Stage에는 주입하지 않는다.
 //
 // 흐름:
@@ -38,16 +39,17 @@
 // 이 Pipeline이 하지 않는 것 (별도 작업):
 //   - hybrid-gitops Promotion PR은 PROMOTION_MODE=OFF(기본)일 때 만들지 않는다.
 //     Evidence(image-metadata.json)는 gitops_change=NONE으로 남기며, Promotion 결과(PR URL)는
-//     별도 파일(promotion-result.txt)에만 기록한다. Cloud는 ecr.final_digest,
+//     환경별 파일(promotion-result-<환경>.txt)에만 기록한다. Cloud는 ecr.final_digest,
 //     Recovery는 harbor.final_digest를 사용하며 두 Digest가 같다고 가정하지 않는다.
-//   - Promotion Stage는 Recovery 환경만 대상으로 한다. lab(승인 매핑 전)·cloud(ECR 입력 전)는 보류.
+//   - Promotion Stage는 Recovery와, ENABLE_ECR=true인 Run에서는 Cloud를 대상으로 한다. lab(승인 매핑 전)은 보류.
 //   - Harbor 비승인 Artifact Retention, ECR Lifecycle 최종 N (Preview 후 확정)
 //
-// 실행 모드 (Build Parameter ENABLE_ECR, 기본 false):
-//   - false (기본): Harbor-only. Build/Scan/Smoke/Promote/Evidence를 Harbor에서만 수행한다.
-//       10/7 OCP 사전검증용 Image/Digest 인계 경로. aws-cli Container와 ECR Credential이 필요 없다.
-//   - true: ECR + Harbor 동시 (결정 A1/B1/C3). aws-cli Pin과 ECR Credential이 준비된 뒤에만 켠다.
-//   Multibranch에서 Parameter는 Jenkinsfile 반영 후 첫 Run은 기본값(false)으로 실행된다.
+// 실행 모드 (Build Parameter ENABLE_ECR, 기본 true):
+//   - true (기본): ECR + Harbor 동시 (결정 A1/B1/C3). 릴리스 후보는 이 모드로 만든다.
+//       한 SHA에 Harbor Final만 생기면 ECR을 나중에 채울 수 없다(Guard가 부분 상태로 중단).
+//   - false: Harbor-only. Build/Scan/Smoke/Promote/Evidence를 Harbor에서만 수행한다.
+//       ECR/AWS 장애 시 임시 빌드용이며 이 SHA는 Cloud 릴리스 후보로 쓰지 않는다.
+//   Multibranch에서 Parameter는 Jenkinsfile 반영 후 첫 Run의 값을 Parameters 탭에서 확인한다.
 //
 // 병합 전 확인이 필요한 값 (아래 TODO 참고):
 //   - ENABLE_ECR=true 사용 시: aws-cli Image 버전/Digest 고정 (Placeholder 문자열이 남아 있으면 중단)
@@ -98,16 +100,18 @@ def HEALTH_CFG = [
 // TODO(#2 E): 2차 Harbor Project 전용 Recovery Pull Robot Secret이 생기면 이름을 확정한다.
 def SMOKE_PULL_SECRETS = ['harbor-pull-secret', 'hybrid-harbor-pull-secret']
 
-// Promotion 실행 헬퍼. 출력은 promotion-result.txt로 남기고 exit 2(또는 0이 아닌 값)는 Build 실패로 처리한다.
+// Promotion 실행 헬퍼. 출력은 환경·단계별 promotion-result-*.txt로 남기고 exit 2(또는 0이 아닌 값)는 Build 실패로 처리한다.
 // PROMOTION_PR_CREATE_UNCERTAIN 등 불확실 상태는 자동 재시도하지 않고 사람이 GitHub에서 확인한다.
-def runPromotion(String modeFlag) {
+def runPromotion(String promotionEnv, String modeFlag) {
+    // 환경마다 결과 파일을 따로 둔다 (한 파일을 덮어쓰지 않는다).
+    def resultFile = "promotion-result-${promotionEnv}-${modeFlag.replace('--', '')}.txt"
     def rc = sh(
         returnStatus: true,
-        script: "python3 scripts/gitops_promote.py --env recovery --metadata image-metadata.json --gitops-dir .ci/gitops ${modeFlag} > promotion-result.txt 2>&1"
+        script: "python3 scripts/gitops_promote.py --env ${promotionEnv} --metadata image-metadata.json --gitops-dir .ci/gitops ${modeFlag} > ${resultFile} 2>&1"
     )
-    echo readFile('promotion-result.txt')
+    echo readFile(resultFile)
     if (rc != 0) {
-        error("GitOps Promotion 실패(exit=${rc}). promotion-result.txt의 PROMOTION_ERROR를 확인하세요. 불확실 상태는 GitHub에서 Branch/PR을 수동 확인하고 자동 재시도하지 마세요.")
+        error("GitOps Promotion 실패(env=${promotionEnv}, exit=${rc}). ${resultFile}의 PROMOTION_ERROR를 확인하세요. 불확실 상태는 GitHub에서 Branch/PR을 수동 확인하고 자동 재시도하지 마세요.")
     }
 }
 
@@ -117,13 +121,13 @@ pipeline {
     parameters {
         booleanParam(
             name: 'ENABLE_ECR',
-            defaultValue: false,
-            description: 'true: ECR+Harbor 동시 Push/Promote (aws-cli Pin·ECR Credential 필요). false: Harbor-only.'
+            defaultValue: true,
+            description: 'true(기본): ECR+Harbor 동시 Push/Promote (aws-cli Pin·ECR Credential 필요). false: Harbor-only 임시 빌드(이 SHA는 ECR을 나중에 채울 수 없어 릴리스 후보로 쓰지 않는다).'
         )
         choice(
             name: 'PROMOTION_MODE',
             choices: ['OFF', 'REMOTE_CHECK', 'WRITE'],
-            description: 'GitOps Promotion (recovery). OFF=Promotion 실행 안 함(기본, Promotion용 GitHub clone/API 접근 없음. 기존 Image/P1 단계는 영향 없음), REMOTE_CHECK=GitOps clone + GitHub 읽기 전용 점검(push/PR 없음), WRITE=Promotion Branch push + PR 1건 생성. 네트워크 없는 pure plan은 Pipeline이 아니라 CLI(gitops_promote.py 기본 모드)로 로컬에서 실행한다.'
+            description: 'GitOps Promotion (recovery, ENABLE_ECR=true이면 cloud 포함). OFF=Promotion 실행 안 함(기본, Promotion용 GitHub clone/API 접근 없음. 기존 Image/P1 단계는 영향 없음), REMOTE_CHECK=GitOps clone + GitHub 읽기 전용 점검(push/PR 없음), WRITE=Promotion Branch push + PR 1건 생성. 네트워크 없는 pure plan은 Pipeline이 아니라 CLI(gitops_promote.py 기본 모드)로 로컬에서 실행한다.'
         )
     }
 
@@ -834,13 +838,13 @@ PYEOF
         }
 
         // --------------------------------------------------------------
-        // GitOps Promotion (recovery 전용, 기본 OFF).
+        // GitOps Promotion (recovery, ENABLE_ECR=true이면 cloud 포함, 기본 OFF).
         // Credential이 없는 app-ci-check Agent에서 실행한다 (Registry 쓰기 Credential 분리).
         // OFF에서는 GitHub 접근(clone/API)이 전혀 없다. clone은 REMOTE_CHECK부터 허용한다.
         // hybrid-gitops-writer PAT는 REMOTE_CHECK/WRITE의 python 실행 구간에만 주입한다.
         // 결과는 PR 1건까지만 만든다. Merge는 사람이 Review 후 한다.
         // --------------------------------------------------------------
-        stage('Promote GitOps (Recovery PR)') {
+        stage('Promote GitOps (Recovery + Cloud PR)') {
             when {
                 beforeAgent true
                 allOf {
@@ -904,7 +908,21 @@ PYEOF
                                 passwordVariable: 'GH_TOKEN'
                             )]) {
                                 script {
-                                    runPromotion(params.PROMOTION_MODE == 'WRITE' ? '--write' : '--remote-check')
+                                    // Recovery는 항상, Cloud는 ECR을 켠 Run에서만 (Planner도 ECR 없는 Run은 Cloud를 바꾸지 않는다).
+                                    def targets = ['recovery']
+                                    if (ecrOn()) {
+                                        targets << 'cloud'
+                                    }
+                                    // 1단계: 모든 환경을 읽기 전용으로 먼저 점검한다. 하나라도 실패하면 아무것도 쓰지 않는다.
+                                    for (target in targets) {
+                                        runPromotion(target, '--remote-check')
+                                    }
+                                    // 2단계: WRITE일 때만 환경별로 Branch push + PR 1건.
+                                    if (params.PROMOTION_MODE == 'WRITE') {
+                                        for (target in targets) {
+                                            runPromotion(target, '--write')
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -914,7 +932,7 @@ PYEOF
             post {
                 always {
                     sh 'rm -rf .ci/gitops || true'
-                    archiveArtifacts artifacts: 'promotion-result.txt', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'promotion-result-*.txt', allowEmptyArchive: true
                 }
             }
         }
