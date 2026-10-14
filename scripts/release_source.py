@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+# 수정 날짜: 2026/10/14 (Cloud 지원: 환경별 출처 경로, ecr_digest, 승인 newName 대조, patches 신설)
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
 """Release-source annotation renderer for hybrid-gitops (hybrid-app #15). Offline, no network.
 
 Given an approved Release candidate (`releases/<release-id>.json`) and a local hybrid-gitops checkout,
-renders `apps/overlays/<env>/release-source.yaml` and registers it once in that overlay's
-`kustomization.yaml` (`patches: - path: release-source.yaml`). The file only sets two annotations on
+renders `release-source.yaml` next to that overlay's `kustomization.yaml` (recovery: apps/overlays/recovery/,
+cloud: apps/overlays/cloud/runtime/) and registers it once there (`patches: - path: release-source.yaml`;
+Cloud has no patches block yet, so one is created). The file only sets two annotations on
 the backend/frontend Deployment *metadata* (never the Pod template), so it cannot cause a rollout:
 
     seokpan.io/app-source-sha   40-hex App commit the Images were built from
@@ -12,8 +14,9 @@ the backend/frontend Deployment *metadata* (never the Pod template), so it canno
 
 Fail-closed rules:
   * The claim must be true: the overlay's current Image digests must equal the candidate's digests
-    (i.e. the Promotion PR was merged first). Otherwise IMAGES_NOT_PROMOTED.
-  * lab is refused until the approved original <-> internal registry mapping exists, cloud until the
+    (recovery: harbor_digest, cloud: ecr_digest; Harbor is never substituted for Cloud). Otherwise
+    IMAGES_NOT_PROMOTED. Cloud's newName must also be the approved ECR URI (NEWNAME_MISMATCH).
+  * lab is refused until the approved original <-> internal registry mapping exists.
     ECR inputs exist (their overlays cannot prove the claim yet).
   * Only the two allowlisted paths are produced. Nothing is committed, pushed or applied here.
 
@@ -41,14 +44,13 @@ import gitops_planner  # noqa: E402
 import release_candidate  # noqa: E402
 import safe_fs  # noqa: E402
 
-SOURCE_FILE = "release-source.yaml"
+SOURCE_FILE = gitops_planner.SOURCE_FILE
 APP_SHA_KEY = "seokpan.io/app-source-sha"
 RELEASE_ID_KEY = "seokpan.io/release-id"
-SUPPORTED_ENVS = ("recovery",)
-HELD_ENVS = {
-    "lab": "LAB_MAPPING_NOT_APPROVED",
-    "cloud": "CLOUD_ECR_INPUTS_NOT_PROVIDED",
-}
+SUPPORTED_ENVS = gitops_planner.SOURCE_ENVS
+HELD_ENVS = {"lab": "LAB_MAPPING_NOT_APPROVED"}
+# Recovery pins the Harbor digest, Cloud the ECR digest; the other registry's digest is never accepted.
+CANDIDATE_DIGEST_KEY = {"recovery": "harbor_digest", "cloud": "ecr_digest"}
 _PATCHES_RE = re.compile(r"^patches:[ \t]*$")
 _REGISTERED_RE = re.compile(r"^[ \t]*-[ \t]+path:[ \t]*release-source\.yaml[ \t]*(?:#.*)?$")
 
@@ -63,7 +65,7 @@ class ReleaseSourceError(RuntimeError):
 
 def source_path(env: str) -> str:
     _check_env(env)
-    return f"apps/overlays/{env}/{SOURCE_FILE}"
+    return gitops_planner.source_path(env)
 
 
 def allowed_paths(env: str) -> set:
@@ -81,7 +83,7 @@ def _check_env(env: str) -> None:
 
 
 def parse_candidate(candidate_text: str, env: str) -> tuple:
-    """(release_id, app_sha, {component: harbor_digest}) after validating the candidate."""
+    """(release_id, app_sha, {component: digest of the env's registry}) after validating the candidate."""
     _check_env(env)
     try:
         candidate = json.loads(candidate_text)
@@ -102,9 +104,10 @@ def parse_candidate(candidate_text: str, env: str) -> tuple:
     digests = {}
     for name in gitops_planner.COMPONENTS:
         entry = images.get(name) if isinstance(images, Mapping) else None
-        digest = entry.get("harbor_digest") if isinstance(entry, Mapping) else None
+        key = CANDIDATE_DIGEST_KEY[env]
+        digest = entry.get(key) if isinstance(entry, Mapping) else None
         if not isinstance(digest, str) or not gitops_planner.DIGEST_RE.match(digest):
-            raise ReleaseSourceError("CANDIDATE_INVALID", f"candidate images.{name}.harbor_digest is not sha256:<64 hex>")
+            raise ReleaseSourceError("CANDIDATE_INVALID", f"candidate images.{name}.{key} is not sha256:<64 hex>")
         digests[name] = digest
     return release_id, app_sha, digests
 
@@ -115,7 +118,16 @@ def check_images_promoted(kustomization_text: str, env: str, digests: Mapping[st
     lines = gitops_planner._split(kustomization_text)
     try:
         for name in gitops_planner.COMPONENTS:
-            ref = gitops_planner._find_entry(lines, path, gitops_planner.IMAGE_NAME[name])
+            # Cloud overlays start as `digest: INPUT_REQUIRED`: an unpromoted placeholder is "not promoted",
+            # not an invalid file.
+            ref = gitops_planner._find_entry(
+                lines, path, gitops_planner.IMAGE_NAME[name], allow_placeholder=(env == "cloud")
+            )
+            if env == "cloud" and ref.new_name != gitops_planner.CLOUD_NEWNAME[name]:
+                raise ReleaseSourceError(
+                    "NEWNAME_MISMATCH",
+                    f"{env} overlay {name} newName is not the approved Cloud ECR repository URI",
+                )
             if ref.digest != digests[name]:
                 raise ReleaseSourceError(
                     "IMAGES_NOT_PROMOTED",
@@ -144,6 +156,34 @@ def render_source(release_id: str, app_sha: str) -> str:
     return header + "---\n".join(docs)
 
 
+_OTHER_PATCH_KEYS_RE = re.compile(r"^(?:patches|patchesStrategicMerge|patchesJson6902):")
+
+
+def _create_patches_block(lines: Sequence[str], path: str) -> str:
+    """Cloud's runtime kustomization has no patches block yet: add one right after the images block.
+
+    Trailing comment/blank lines belong to the next block (e.g. the configMapGenerator note), so the new
+    block goes before them. Any other existing patches form is refused rather than guessed.
+    """
+    if any(_OTHER_PATCH_KEYS_RE.match(gitops_planner._bare(line)) for line in lines):
+        raise ReleaseSourceError("PATCHES_BLOCK", f"{path}: unsupported existing patches form; refusing to create a block")
+    try:
+        _, end = gitops_planner._images_block(lines, path)
+    except gitops_planner.PlanError as exc:
+        raise ReleaseSourceError("KUSTOMIZATION_INVALID", str(exc))
+    at = end
+    while at > 0:
+        bare = gitops_planner._bare(lines[at - 1])
+        if bare.strip() and not bare.lstrip().startswith("#"):
+            break
+        at -= 1
+    if at == 0 or not gitops_planner._eol(lines[at - 1]):
+        raise ReleaseSourceError("PATCHES_BLOCK", f"{path}: cannot place a patches block after the images block")
+    eol = gitops_planner._eol(lines[at - 1])
+    block = [f"patches:{eol}", f"  - path: {SOURCE_FILE}{eol}"]
+    return "".join(list(lines[:at]) + block + list(lines[at:]))
+
+
 def register_patch(kustomization_text: str, env: str) -> str:
     """Add `- path: release-source.yaml` under `patches:` once; every other byte stays as-is."""
     path = gitops_planner.ENV_KUSTOMIZATION[env]
@@ -151,6 +191,8 @@ def register_patch(kustomization_text: str, env: str) -> str:
     if any(_REGISTERED_RE.match(gitops_planner._bare(line)) for line in lines):
         return kustomization_text
     blocks = [i for i, line in enumerate(lines) if _PATCHES_RE.match(gitops_planner._bare(line))]
+    if env == "cloud" and not blocks:
+        return _create_patches_block(lines, path)
     if len(blocks) != 1:
         raise ReleaseSourceError("PATCHES_BLOCK", f"{path}: expected exactly one top-level patches block, got {len(blocks)}")
     eol = gitops_planner._eol(lines[blocks[0]]) or "\n"
