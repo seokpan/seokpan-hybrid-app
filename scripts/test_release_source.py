@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
+# 수정 날짜: 2026/10/14 (Cloud 지원 시험 보완, Promotion 연동 시험)
 """Unit tests for scripts/release_source.py (hybrid-app #15; offline, temporary files only)."""
 
 from __future__ import annotations
 
 import contextlib
+import copy
+import dataclasses
 import io
 import json
 import os
@@ -119,13 +122,17 @@ class PlanTests(unittest.TestCase):
             target.plan_release_source(candidate(be=fx.NEW_BE), "recovery", self.files())
         self.assertEqual(ctx.exception.code, "IMAGES_NOT_PROMOTED")
 
-    def test_lab_and_cloud_are_held_with_their_own_codes(self) -> None:
-        for env, code in (("lab", "LAB_MAPPING_NOT_APPROVED"), ("cloud", "CLOUD_ECR_INPUTS_NOT_PROVIDED")):
-            with self.subTest(env=env), self.assertRaises(target.ReleaseSourceError) as ctx:
-                target.plan_release_source(candidate(), env, self.files())
-            self.assertEqual(ctx.exception.code, code)
+    def test_lab_is_held_with_its_own_code(self) -> None:
+        with self.assertRaises(target.ReleaseSourceError) as ctx:
+            target.plan_release_source(candidate(), "lab", self.files())
+        self.assertEqual(ctx.exception.code, "LAB_MAPPING_NOT_APPROVED")
         with self.assertRaises(target.ReleaseSourceError):
             target.source_path("lab")
+
+    def test_cloud_is_no_longer_held(self) -> None:
+        self.assertIn("cloud", target.SUPPORTED_ENVS)
+        self.assertEqual(target.source_path("cloud"), "apps/overlays/cloud/runtime/release-source.yaml")
+        self.assertEqual(target.source_path("recovery"), SRC)  # Recovery path is unchanged
 
     def test_invalid_candidates_are_rejected(self) -> None:
         good = json.loads(candidate())
@@ -151,6 +158,351 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(target.ReleaseSourceError) as ctx:
             target.plan_release_source(candidate(), "recovery", {KUST: placeholder})
         self.assertEqual(ctx.exception.code, "KUSTOMIZATION_INVALID")
+
+
+# ---------------------------------------------------------------- Cloud (hybrid-app #50)
+CLOUD_KUST = gitops_planner.ENV_KUSTOMIZATION["cloud"]
+CLOUD_SRC = "apps/overlays/cloud/runtime/release-source.yaml"
+CLOUD_RID = f"rel-cloud-20261008T030000Z-{APP_SHA[:12]}-a1b2c3d4"
+E_BE = "sha256:" + "9" * 64
+E_FE = "sha256:" + "8" * 64  # differs from E_BE so a swapped component cannot pass unnoticed
+STALE = "sha256:" + "c" * 64
+APPROVED = gitops_planner.CLOUD_NEWNAME
+PATCH_LINE = "  - path: release-source.yaml\n"
+
+# mirrors the real apps/overlays/cloud/runtime/kustomization.yaml: no patches block, and a comment
+# that belongs to configMapGenerator right after the images block
+CLOUD_HEAD = """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Actual Cloud namespace/owner input is not yet handed over.
+namespace: cloud-input-required
+resources:
+  - ../../../base
+  - routes.yaml
+images:
+"""
+CLOUD_NOTE = """\
+# envFrom is read on Pod startup: keep the generated content hash so a
+# reviewed runtime configuration change also changes the Pod template ref.
+"""
+CLOUD_TAIL = CLOUD_NOTE + """\
+configMapGenerator:
+  - name: backend-config
+    behavior: merge
+    envs: [runtime.env]
+"""
+
+
+def cloud_images(be: str = E_BE, fe: str = E_FE, be_name: str = APPROVED["backend"],
+                 fe_name: str = APPROVED["frontend"]) -> str:
+    return (
+        "  # newName is fixed to the foundation ECR repositories.\n"
+        f"  - name: seokpan-backend\n    newName: {be_name}\n    digest: {be}\n"
+        f"  - name: seokpan-frontend\n    newName: {fe_name}\n    digest: {fe}\n"
+    )
+
+
+def cloud_kust_text(**kw) -> str:
+    return CLOUD_HEAD + cloud_images(**kw) + CLOUD_TAIL
+
+
+def cloud_meta(be: str = E_BE, fe: str = E_FE) -> dict:
+    meta = copy.deepcopy(fx.metadata(ecr=True))
+    for name, digest in (("backend", be), ("frontend", fe)):
+        meta["components"][name]["ecr"]["final_digest"] = digest
+        meta["release_json_images"][name]["ecr_digest"] = digest
+    return meta
+
+
+def cloud_candidate(be: str = E_BE, fe: str = E_FE, rid: str = CLOUD_RID) -> str:
+    return release_candidate.render_json(release_candidate.build_candidate(cloud_meta(be, fe), "cloud", rid))
+
+
+class CloudRegisterTests(unittest.TestCase):
+    def test_creates_the_block_after_images_and_before_the_generator_note(self) -> None:
+        old = cloud_kust_text()
+        new = target.register_patch(old, "cloud")
+        self.assertEqual(new, old.replace(CLOUD_NOTE, "patches:\n" + PATCH_LINE + CLOUD_NOTE, 1))
+        self.assertEqual(new.count("patches:"), 1)
+
+    def test_crlf_is_preserved(self) -> None:
+        old = cloud_kust_text().replace("\n", "\r\n")
+        new = target.register_patch(old, "cloud")
+        block = "patches:\r\n" + PATCH_LINE.replace("\n", "\r\n")
+        self.assertIn(block, new)
+        self.assertEqual(new.replace(block, "", 1), old)
+        self.assertNotIn("\n", new.replace("\r\n", ""))
+
+    def test_is_idempotent(self) -> None:
+        once = target.register_patch(cloud_kust_text(), "cloud")
+        self.assertEqual(target.register_patch(once, "cloud"), once)
+
+    def test_an_existing_patches_block_is_extended_not_duplicated(self) -> None:
+        old = cloud_kust_text() + "patches:\n  - path: other.yaml\n"
+        new = target.register_patch(old, "cloud")
+        self.assertEqual(new.count("patches:"), 1)
+        self.assertEqual(new.replace(PATCH_LINE, "", 1), old)
+
+    def test_unsupported_existing_patch_forms_are_refused(self) -> None:
+        cases = {
+            "empty list": cloud_kust_text() + "patches: []\n",
+            "strategic merge": cloud_kust_text() + "patchesStrategicMerge:\n  - x.yaml\n",
+            "two blocks": cloud_kust_text() + "patches:\n  - path: a.yaml\npatches:\n  - path: b.yaml\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(target.ReleaseSourceError) as cm:
+                    target.register_patch(text, "cloud")
+                self.assertEqual(cm.exception.code, "PATCHES_BLOCK")
+
+    def test_images_block_last_with_trailing_newline_works(self) -> None:
+        old = CLOUD_HEAD + cloud_images()
+        self.assertEqual(target.register_patch(old, "cloud"), old + "patches:\n" + PATCH_LINE)
+
+    def test_images_block_last_without_trailing_newline_is_refused(self) -> None:
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.register_patch((CLOUD_HEAD + cloud_images()).rstrip("\n"), "cloud")
+        self.assertEqual(cm.exception.code, "PATCHES_BLOCK")
+
+    def test_missing_images_block_is_refused(self) -> None:
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.register_patch(CLOUD_HEAD.replace("images:\n", "") + CLOUD_TAIL, "cloud")
+        self.assertEqual(cm.exception.code, "KUSTOMIZATION_INVALID")
+
+
+class CloudPlanTests(unittest.TestCase):
+    def files(self, **kw) -> dict:
+        return {CLOUD_KUST: cloud_kust_text(**kw)}
+
+    def test_happy_path_produces_exactly_two_allowlisted_files_in_the_runtime_folder(self) -> None:
+        plan = target.plan_release_source(cloud_candidate(), "cloud", self.files())
+        self.assertEqual(plan.status, "CHANGES")
+        self.assertEqual(set(plan.new_files), {CLOUD_KUST, CLOUD_SRC})
+        self.assertEqual(set(plan.new_files), target.allowed_paths("cloud"))
+        self.assertEqual(os.path.dirname(CLOUD_SRC), os.path.dirname(CLOUD_KUST))
+        self.assertEqual(plan.release_id, CLOUD_RID)
+        self.assertEqual(plan.new_files[CLOUD_SRC], target.render_source(CLOUD_RID, APP_SHA))
+        self.assertEqual(plan.new_files[CLOUD_KUST], target.register_patch(cloud_kust_text(), "cloud"))
+        self.assertIn("+++ b/" + CLOUD_SRC, plan.unified_diff())
+
+    def test_rerun_with_current_files_is_no_change(self) -> None:
+        first = target.plan_release_source(cloud_candidate(), "cloud", self.files())
+        again = target.plan_release_source(cloud_candidate(), "cloud", dict(first.new_files))
+        self.assertEqual(again.status, "NO_CHANGE")
+
+    def test_images_not_yet_promoted_are_rejected(self) -> None:
+        placeholder = gitops_planner.INPUT_PLACEHOLDER
+        cases = {
+            "both placeholders": dict(be=placeholder, fe=placeholder),
+            "backend placeholder": dict(be=placeholder),
+            "frontend stale digest": dict(fe=STALE),
+            "harbor digests are not ECR digests": dict(be=fx.H_BE, fe=fx.H_FE),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(target.ReleaseSourceError) as cm:
+                    target.plan_release_source(cloud_candidate(), "cloud", self.files(**kw))
+                self.assertEqual(cm.exception.code, "IMAGES_NOT_PROMOTED")
+
+    def test_newname_must_be_the_approved_ecr_uri(self) -> None:
+        wrong = {
+            "other account": lambda c: APPROVED[c].replace("847835841591", "123456789012"),
+            "other repository": lambda c: APPROVED[c] + "-x",
+            "harbor-style name": lambda c: f"harbor.example/seokpan-hybrid/{c}",
+            "other component's repository": lambda c: APPROVED["frontend" if c == "backend" else "backend"],
+        }
+        for label, make in wrong.items():
+            for comp in ("backend", "frontend"):
+                kw = {("be_name" if comp == "backend" else "fe_name"): make(comp)}
+                with self.subTest(label=label, component=comp):
+                    with self.assertRaises(target.ReleaseSourceError) as cm:
+                        target.plan_release_source(cloud_candidate(), "cloud", self.files(**kw))
+                    self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
+
+    def test_candidate_without_a_valid_ecr_digest_is_rejected(self) -> None:
+        good = json.loads(cloud_candidate())
+        for comp in ("backend", "frontend"):
+            for label, change in (
+                ("null", lambda e: e.update(ecr_digest=None)),
+                ("absent", lambda e: e.pop("ecr_digest")),
+                ("malformed", lambda e: e.update(ecr_digest="sha256:xyz")),
+            ):
+                bad = copy.deepcopy(good)
+                change(bad["images"][comp])  # harbor_digest stays: it must never stand in for ECR
+                with self.subTest(component=comp, case=label):
+                    with self.assertRaises(target.ReleaseSourceError) as cm:
+                        target.plan_release_source(json.dumps(bad), "cloud", self.files())
+                    self.assertEqual(cm.exception.code, "CANDIDATE_INVALID")
+
+    def test_cloud_reads_ecr_digests_and_recovery_reads_harbor_digests(self) -> None:
+        _, _, cloud = target.parse_candidate(cloud_candidate(), "cloud")
+        self.assertEqual(cloud, {"backend": E_BE, "frontend": E_FE})
+        _, _, recovery = target.parse_candidate(candidate(), "recovery")
+        self.assertEqual(recovery, {"backend": fx.OLD_BE, "frontend": fx.OLD_FE})
+
+    def test_recovery_never_falls_back_to_the_ecr_digest(self) -> None:
+        bad = json.loads(candidate())
+        bad["images"]["backend"]["harbor_digest"] = None
+        bad["images"]["backend"]["ecr_digest"] = E_BE
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.plan_release_source(json.dumps(bad), "recovery", {KUST: kust_text()})
+        self.assertEqual(cm.exception.code, "CANDIDATE_INVALID")
+
+
+class CloudCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.gitops = root / "gitops"
+        (self.gitops / CLOUD_KUST).parent.mkdir(parents=True)
+        self.write_kust(cloud_kust_text())
+        self.release = root / "rel.json"
+        self.release.write_text(cloud_candidate(), encoding="utf-8")
+
+    def write_kust(self, text: str) -> None:
+        with open(self.gitops / CLOUD_KUST, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def call(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--env", "cloud", "--release-file", str(self.release), "--gitops-dir", str(self.gitops), *extra]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = target.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def snapshot(self) -> dict:
+        return {str(p.relative_to(self.gitops)): p.read_bytes() for p in self.gitops.rglob("*") if p.is_file()}
+
+    def test_write_creates_the_source_file_and_patches_block_and_second_run_is_no_change(self) -> None:
+        before = set(self.snapshot())
+        rc, out, _ = self.call("--write")
+        self.assertEqual(rc, 0)
+        self.assertIn("RELEASE_SOURCE_STATUS=WRITTEN", out)
+        self.assertEqual(set(self.snapshot()) - before, {CLOUD_SRC})
+        self.assertIn("patches:\n" + PATCH_LINE, (self.gitops / CLOUD_KUST).read_text(encoding="utf-8"))
+        self.assertEqual((self.gitops / CLOUD_SRC).read_text(encoding="utf-8"),
+                         target.render_source(CLOUD_RID, APP_SHA))
+        rc, out, _ = self.call("--write")
+        self.assertEqual(rc, 0)
+        self.assertIn("RELEASE_SOURCE_STATUS=NO_CHANGE", out)
+
+    def test_unpromoted_overlay_exits_2_and_writes_nothing(self) -> None:
+        self.write_kust(cloud_kust_text(be=gitops_planner.INPUT_PLACEHOLDER, fe=gitops_planner.INPUT_PLACEHOLDER))
+        before = self.snapshot()
+        rc, _, err = self.call("--write")
+        self.assertEqual(rc, 2)
+        self.assertIn("IMAGES_NOT_PROMOTED", err)
+        self.assertEqual(self.snapshot(), before)
+
+
+# ---------------------------------------------------------------- Promotion attach (hybrid-app #50)
+def promoted_recovery_plan(files: dict = None):
+    """Plan a real Recovery promotion (OLD -> NEW digests); returns (plan, metadata)."""
+    meta = fx.metadata(be=fx.NEW_BE, fe=fx.NEW_FE)
+    plan = gitops_planner.plan_promotion(
+        meta, "recovery", ["backend", "frontend"], files if files is not None else {KUST: kust_text()}
+    )
+    return plan, meta
+
+
+def recovery_candidate_for(meta: dict) -> str:
+    return release_candidate.render_json(release_candidate.build_candidate(meta, "recovery", wx.RID))
+
+
+def promoted_cloud_plan():
+    """Plan a real Cloud promotion (INPUT_REQUIRED -> ECR digests); returns (plan, files)."""
+    placeholder = gitops_planner.INPUT_PLACEHOLDER
+    files = {CLOUD_KUST: cloud_kust_text(be=placeholder, fe=placeholder)}
+    plan = gitops_planner.plan_promotion(cloud_meta(), "cloud", ["backend", "frontend"], files)
+    return plan, files
+
+
+class AttachToPlanTests(unittest.TestCase):
+    def test_recovery_adds_the_annotation_to_the_same_plan(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        out = target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text()})
+        self.assertEqual(set(out.new_files), {KUST, SRC})
+        self.assertEqual(set(out.new_files), target.allowed_paths("recovery"))
+        self.assertEqual(out.new_files[KUST], target.register_patch(plan.new_files[KUST], "recovery"))
+        self.assertEqual(out.new_files[SRC], target.render_source(wx.RID, APP_SHA))
+        self.assertEqual(out.old_files, {KUST: kust_text()})
+        self.assertEqual(out.image_changes, plan.image_changes)
+        self.assertIn(fx.NEW_BE, out.new_files[KUST])
+        self.assertNotIn(fx.OLD_BE, out.new_files[KUST])
+        diff = out.unified_diff()
+        self.assertIn("--- /dev/null", diff)
+        self.assertIn("+++ b/" + SRC, diff)
+
+    def test_cloud_adds_the_annotation_to_the_same_plan(self) -> None:
+        plan, files = promoted_cloud_plan()
+        out = target.attach_to_plan(plan, cloud_candidate(), files)
+        self.assertEqual(set(out.new_files), {CLOUD_KUST, CLOUD_SRC})
+        self.assertEqual(set(out.new_files), target.allowed_paths("cloud"))
+        self.assertEqual(out.new_files[CLOUD_KUST], target.register_patch(plan.new_files[CLOUD_KUST], "cloud"))
+        self.assertEqual(out.new_files[CLOUD_SRC], target.render_source(CLOUD_RID, APP_SHA))
+        self.assertEqual(out.old_files, {CLOUD_KUST: files[CLOUD_KUST]})
+        self.assertIn(E_BE, out.new_files[CLOUD_KUST])
+        self.assertNotIn(gitops_planner.INPUT_PLACEHOLDER, out.new_files[CLOUD_KUST])
+        self.assertIn("--- /dev/null", out.unified_diff())
+
+    def test_no_change_plan_is_returned_untouched(self) -> None:
+        meta = fx.metadata(be=fx.OLD_BE, fe=fx.OLD_FE)
+        plan = gitops_planner.plan_promotion(meta, "recovery", ["backend", "frontend"], {KUST: kust_text()})
+        self.assertEqual(plan.status, "NO_CHANGE")
+        self.assertIs(target.attach_to_plan(plan, "not even parsed", {}), plan)
+
+    def test_lab_plan_is_returned_untouched(self) -> None:
+        plan = gitops_planner.PlanResult("lab", ("backend", "frontend"), APP_SHA, (), {"x": "a"}, {"x": "b"}, ())
+        self.assertIs(target.attach_to_plan(plan, "not even parsed", {}), plan)
+
+    def test_candidate_that_differs_from_the_planned_digests_is_rejected(self) -> None:
+        plan, _ = promoted_recovery_plan()
+        other = recovery_candidate_for(fx.metadata(be=fx.H_BE, fe=fx.H_FE))
+        with self.subTest(env="recovery"):
+            with self.assertRaises(target.ReleaseSourceError) as cm:
+                target.attach_to_plan(plan, other, {KUST: kust_text()})
+            self.assertEqual(cm.exception.code, "IMAGES_NOT_PROMOTED")
+        cloud_plan, files = promoted_cloud_plan()
+        with self.subTest(env="cloud"):
+            with self.assertRaises(target.ReleaseSourceError) as cm:
+                target.attach_to_plan(cloud_plan, cloud_candidate(be=STALE), files)
+            self.assertEqual(cm.exception.code, "IMAGES_NOT_PROMOTED")
+
+    def test_plan_and_candidate_must_share_the_app_sha(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        skewed = dataclasses.replace(plan, app_sha="0" * 40)
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.attach_to_plan(skewed, recovery_candidate_for(meta), {KUST: kust_text()})
+        self.assertEqual(cm.exception.code, "CANDIDATE_INVALID")
+
+    def test_an_existing_source_file_becomes_the_old_side_of_the_diff(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        stale = target.render_source(f"rel-recovery-20261009T010000Z-{APP_SHA[:12]}-c3d4e5f6", APP_SHA)
+        out = target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text(), SRC: stale})
+        self.assertEqual(out.old_files[SRC], stale)
+        self.assertEqual(out.new_files[SRC], target.render_source(wx.RID, APP_SHA))
+        self.assertIn("--- a/" + SRC, out.unified_diff())
+
+    def test_an_identical_source_file_is_not_rewritten(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        same = target.render_source(wx.RID, APP_SHA)
+        out = target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text(), SRC: same})
+        self.assertEqual(set(out.new_files), {KUST})
+
+    def test_a_kustomization_without_a_single_patches_block_is_refused(self) -> None:
+        text = kust_text().replace("patches:\n", "other:\n")
+        plan, meta = promoted_recovery_plan({KUST: text})
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: text})
+        self.assertEqual(cm.exception.code, "PATCHES_BLOCK")
+
+    def test_the_original_plan_is_not_mutated(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        before = (dict(plan.new_files), dict(plan.old_files))
+        target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text()})
+        self.assertEqual((dict(plan.new_files), dict(plan.old_files)), before)
 
 
 class CliTests(unittest.TestCase):
@@ -197,7 +549,7 @@ class CliTests(unittest.TestCase):
 
     def test_errors_exit_2_and_write_nothing(self) -> None:
         before = self.snapshot()
-        for args, env in (((), "lab"), (("--write",), "cloud")):
+        for args, env in (((), "lab"), (("--write",), "lab")):
             rc, _, err = self.call(*args, env=env)
             self.assertEqual(rc, 2)
             self.assertIn("RELEASE_SOURCE_ERROR", err)

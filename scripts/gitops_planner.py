@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/07
 # 수정 날짜: 2026-10-13 (Cloud ECR digest 갱신)
+# 수정 날짜: 2026-10-14 (Recovery FE/BE 동시 갱신 필수, release-source 허용 경로, 새 파일 diff)
 """hybrid-gitops Image Promotion pure planner (hybrid-app #15).
 
 입력(image-metadata.json 내용 + 로컬 checkout 파일 내용)만으로 선택 환경의 FE/BE Image
@@ -265,8 +266,22 @@ def _verify_minimal_edit(path: str, old: Sequence[str], new: Sequence[str], expe
 
 # ---------------------------------------------------------------- allowlist
 
+# release-source annotations (hybrid-app #50): only recovery and cloud, never lab. The path is derived from
+# the overlay's kustomization directory, so Cloud's `runtime/` layout needs no special case.
+SOURCE_FILE = "release-source.yaml"
+SOURCE_ENVS = ("recovery", "cloud")
+
+
+def source_path(env: str) -> str:
+    if env not in SOURCE_ENVS:
+        raise PlanError("SOURCE_ENV_UNSUPPORTED", f"release-source is not supported for env '{env}'")
+    return ENV_KUSTOMIZATION[env].rsplit("/", 1)[0] + "/" + SOURCE_FILE
+
+
 def allowed_paths(env: str, components: Iterable[str]) -> set:
     paths = {ENV_KUSTOMIZATION[env]}
+    if env in SOURCE_ENVS:
+        paths.add(source_path(env))
     if env == "lab" and "backend" in set(components):
         paths.add(MIGRATION_PATH)
     return paths
@@ -369,11 +384,12 @@ class PlanResult:
     def unified_diff(self) -> str:
         chunks = []
         for path in sorted(self.new_files):
+            old = self.old_files.get(path)  # a newly created file (release-source.yaml) has no old text
             chunks.extend(
                 difflib.unified_diff(
-                    self.old_files[path].splitlines(keepends=True),
+                    (old or "").splitlines(keepends=True),
                     self.new_files[path].splitlines(keepends=True),
-                    fromfile=f"a/{path}",
+                    fromfile=f"a/{path}" if old is not None else "/dev/null",
                     tofile=f"b/{path}",
                 )
             )
@@ -407,6 +423,14 @@ def plan_promotion(
         raise PlanError(
             "CLOUD_COMPONENTS_REQUIRED",
             "Cloud backend and frontend digests are promoted together from one release candidate; select both components",
+        )
+
+    if env == "recovery" and set(selected) != set(COMPONENTS):
+        # Candidate JSON always records both Digests, so a partial Recovery promotion would leave the
+        # overlay and the candidate out of sync (release-source check and GitOps F4 test need both).
+        raise PlanError(
+            "RECOVERY_COMPONENTS_REQUIRED",
+            "Recovery backend and frontend digests are promoted together from one release candidate; select both components",
         )
 
     path = ENV_KUSTOMIZATION[env]

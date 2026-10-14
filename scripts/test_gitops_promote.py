@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
+# 수정 날짜: 2026/10/14 (release-source 출처 주석 연동 시험, 픽스처를 실제 overlay 구조로 정렬)
 """Unit tests for scripts/gitops_promote.py (hybrid-app #15; mock transport, real files, real git for HEAD)."""
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import gitops_writer  # noqa: E402
 import release_candidate  # noqa: E402
 import test_gitops_planner as fx  # noqa: E402
 import test_gitops_writer as wx  # noqa: E402
+import test_release_source as rs  # noqa: E402
 
 TOKEN = wx.TOKEN
 ENV = {"GH_USER": "writer", "GH_TOKEN": TOKEN}
@@ -36,7 +38,7 @@ class Harness(unittest.TestCase):
         kust = self.gitops / gitops_planner.ENV_KUSTOMIZATION["recovery"]
         kust.parent.mkdir(parents=True)
         with open(kust, "w", encoding="utf-8", newline="") as f:
-            f.write(fx.RECOVERY_KUST)
+            f.write(rs.kust_text())  # the real overlay has a patches block (release-source registers into it)
         self.metadata = root / "image-metadata.json"
         self.write_metadata(wx.meta())
         self.factory_calls: list = []
@@ -134,7 +136,7 @@ class RemoteTests(Harness):
         self.assertEqual([c[0] for c in self.transport.mutations()], ["push_commit", "create_pull_request"])
         self.assertEqual(self.transport.pr_created["base"], "main")
         pushed = self.transport.pushed["files"]
-        self.assertEqual(len(pushed), 2)  # kustomization + releases/<id>.json
+        self.assertEqual(len(pushed), 3)  # kustomization + release-source.yaml + releases/<id>.json
         rid = [l.split("=", 1)[1] for l in out.splitlines() if l.startswith("PROMOTION_RELEASE_ID=")][0]
         self.assertIn(f"releases/{rid}.json", pushed)
         candidate = json.loads(pushed[f"releases/{rid}.json"])
@@ -177,6 +179,37 @@ class RemoteTests(Harness):
             rc = target.run(argv, environ={})  # default factory: the real GitHubApiTransport
         self.assertEqual(rc, 2)
         self.assertIn("PROMOTION_ERROR", err.getvalue())
+
+
+class ReleaseSourceWiringTests(Harness):
+    def test_write_puts_the_annotation_in_the_same_commit_as_the_digests(self) -> None:
+        rc, out, _ = self.call("--write")
+        self.assertEqual(rc, 0)
+        rid = [l.split("=", 1)[1] for l in out.splitlines() if l.startswith("PROMOTION_RELEASE_ID=")][0]
+        pushed = self.transport.pushed["files"]
+        self.assertEqual(set(pushed), {rs.KUST, rs.SRC, f"releases/{rid}.json"})
+        self.assertEqual(pushed[rs.SRC], rs.target.render_source(rid, fx.SHA))
+        self.assertIn("  - path: release-source.yaml\n", pushed[rs.KUST])
+        self.assertIn(fx.NEW_BE, pushed[rs.KUST])
+        self.assertIn(fx.NEW_FE, pushed[rs.KUST])
+        self.assertNotIn(fx.OLD_BE, pushed[rs.KUST])
+
+    def test_missing_patches_block_fails_before_any_credential_is_read(self) -> None:
+        (self.gitops / rs.KUST).write_text(fx.RECOVERY_KUST, encoding="utf-8")  # no patches block
+        rc, _, err = self.call("--write")
+        self.assertEqual(rc, 2)
+        self.assertIn("PATCHES_BLOCK", err)
+        self.assertEqual(self.factory_calls, [])
+        self.assertEqual(self.transport.calls, [])
+
+    def test_pr_text_mentions_the_annotation_only_when_it_is_included(self) -> None:
+        plan, meta = rs.promoted_recovery_plan()
+        with_src = rs.target.attach_to_plan(plan, rs.recovery_candidate_for(meta), {rs.KUST: rs.kust_text()})
+        _, body = gitops_writer.build_pr_text(with_src, wx.RID, tuple(sorted(with_src.new_files)), meta)
+        self.assertIn("release-source 출처 주석", body)
+        self.assertIn(rs.SRC, body)
+        _, plain = gitops_writer.build_pr_text(plan, wx.RID, tuple(sorted(plan.new_files)), meta)
+        self.assertNotIn("release-source 출처 주석", plain)
 
 
 class GitHeadTests(Harness):
