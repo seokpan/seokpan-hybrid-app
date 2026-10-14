@@ -44,13 +44,13 @@ class PromotionStageTest(unittest.TestCase):
 
     def test_stage_is_top_level_after_image_stage(self):
         self.assertLess(TEXT.index("stage('Image Build & Registry Operations')"),
-                        TEXT.index("stage('Promote GitOps (Recovery PR)')"))
+                        TEXT.index("stage('Promote GitOps (Recovery + Cloud PR)')"))
         stages = block("    stages {")
-        self.assertIn("Promote GitOps (Recovery PR)", stages)
+        self.assertIn("Promote GitOps (Recovery + Cloud PR)", stages)
 
     def test_credential_only_in_promotion_stage(self):
         self.assertEqual(TEXT.count("withCredentials([usernamePassword(\n                                credentialsId: env.GITOPS_WRITER_CRED"), 1)
-        promo = block("stage('Promote GitOps (Recovery PR)')")
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
         image = block("stage('Image Build & Registry Operations')")
         self.assertNotIn("hybrid-gitops-writer", image)
         self.assertNotIn("GITOPS_WRITER_CRED", image)
@@ -75,17 +75,18 @@ class PromotionStageTest(unittest.TestCase):
 
     def test_write_only_for_write_mode(self):
         self.assertEqual(TEXT.count("'--write'"), 1)
-        self.assertIn("params.PROMOTION_MODE == 'WRITE' ? '--write' : '--remote-check'", TEXT)
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
+        self.assertIn("if (params.PROMOTION_MODE == 'WRITE') {", promo)
+        self.assertGreater(promo.index("'--write'"), promo.index("if (params.PROMOTION_MODE == 'WRITE') {"))
 
     def test_main_only_and_p1_required(self):
-        promo = block("stage('Promote GitOps (Recovery PR)')")
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
         for needle in ("PROMOTION_MODE != 'OFF'", "env.P1_PASSED == 'true'", "currentResult == 'SUCCESS'", "env.BRANCH_NAME != 'main'"):
             self.assertIn(needle, promo)
 
-    def test_recovery_only_and_approved_remote(self):
-        self.assertIn("--env recovery", TEXT)
+    def test_only_recovery_and_cloud_are_promoted_from_the_approved_remote(self):
+        self.assertIn("--env ${promotionEnv}", TEXT)
         self.assertNotIn("--env lab", TEXT)
-        self.assertNotIn("--env cloud", TEXT)
         self.assertIn("https://github.com/seokpan/seokpan-hybrid-gitops.git", TEXT)
 
     def test_failure_is_not_ignored(self):
@@ -98,9 +99,47 @@ class PromotionStageTest(unittest.TestCase):
         self.assertIn("unstash 'image-evidence'", TEXT)
         self.assertIn("rm -rf .ci/gitops", TEXT)
 
+    def test_cloud_target_only_when_ecr_is_enabled(self):
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
+        self.assertIn("def targets = ['recovery']", promo)
+        self.assertRegex(promo, r"if \(ecrOn\(\)\) \{\s*targets << 'cloud'")
+        self.assertEqual(promo.count("'cloud'"), 1)
+        self.assertEqual(promo.count("'recovery'"), 1)
+
+    def test_remote_check_runs_for_every_target_before_any_write(self):
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
+        check = promo.index("runPromotion(target, '--remote-check', baseSha)")
+        write = promo.index("runPromotion(target, '--write', baseSha)")
+        self.assertLess(check, write)
+
+    def test_each_environment_keeps_its_own_result_files(self):
+        helper = block("def runPromotion")
+        self.assertIn("promotion-result-${promotionEnv}-", helper)
+        self.assertNotIn("promotion-result.txt", TEXT)
+        self.assertIn("promotion-result-*.txt", TEXT)
+
+    def test_ecr_is_on_by_default_and_promotion_stays_off(self):
+        m = re.search(r"booleanParam\(\s*name: 'ENABLE_ECR',\s*defaultValue: (true|false)", TEXT)
+        self.assertTrue(m)
+        self.assertEqual(m.group(1), "true")
+        m = re.search(r"choice\(\s*name: 'PROMOTION_MODE',\s*choices: \[([^\]]*)\]", TEXT)
+        self.assertTrue(m.group(1).lstrip().startswith("'OFF'"))
+
+    def test_base_sha_is_pinned_once_and_checkout_is_restored_before_every_run(self):
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
+        helper = block("def runPromotion")
+        self.assertEqual(promo.count("rev-parse HEAD"), 1)  # pinned once, from the first clone
+        self.assertLess(promo.index("def baseSha"),
+                        promo.index("runPromotion(target, '--remote-check', baseSha)"))
+        self.assertIn("baseSha ==~ /[0-9a-f]{40}/", promo)
+        self.assertIn("switch --detach ${baseSha}", helper)
+        self.assertIn("--expected-base-sha ${baseSha}", helper)
+        self.assertLess(helper.index("switch --detach"), helper.index("gitops_promote.py"))
+        self.assertNotIn("git fetch", helper)  # the base is never refreshed
+        self.assertNotIn("git -C .ci/gitops pull", TEXT)
+
     def test_no_secret_literals(self):
         self.assertNotRegex(TEXT, r"github_pat_|ghp_[A-Za-z0-9]{10,}")
-
 
 if __name__ == "__main__":
     unittest.main()
