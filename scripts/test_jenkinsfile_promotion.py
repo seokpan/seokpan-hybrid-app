@@ -131,7 +131,7 @@ class PromotionStageTest(unittest.TestCase):
         self.assertEqual(promo.count("rev-parse HEAD"), 1)  # pinned once, from the first clone
         self.assertLess(promo.index("def baseSha"),
                         promo.index("runPromotion(target, '--remote-check', baseSha)"))
-        self.assertIn("matches('[0-9a-f]{40}')", promo)
+        self.assertIn("baseSha ==~ /[0-9a-f]{40}/", promo)
         self.assertIn("switch --detach ${baseSha}", helper)
         self.assertIn("--expected-base-sha ${baseSha}", helper)
         self.assertLess(helper.index("switch --detach"), helper.index("gitops_promote.py"))

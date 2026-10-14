@@ -925,7 +925,7 @@ PYEOF
                                     // 최초 clone의 main SHA를 고정한다. 모든 점검과 쓰기는 이 SHA를 기준으로 하며,
                                     // 원격 main이 이동하면 Writer의 PROMOTION_BASE_MOVED가 차단한다.
                                     def baseSha = sh(returnStdout: true, script: 'git -C .ci/gitops rev-parse HEAD').trim()
-                                    if (!baseSha.matches('[0-9a-f]{40}')) {
+                                    if (!(baseSha ==~ /[0-9a-f]{40}/)) {
                                         error('GitOps base SHA를 확인하지 못했습니다.')
                                     }
                                     echo "GitOps base SHA(pinned): ${baseSha}"
