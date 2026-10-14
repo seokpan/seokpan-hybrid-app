@@ -94,9 +94,10 @@ class CloudPlanner(unittest.TestCase):
 
     def test_single_component_cloud_promotion_is_rejected(self):
         for components in (("backend",), ("frontend",)):
-            with self.subTest(components=components), self.assertRaises(PlanError) as cm:
-                plan(overlay(), components=components)
-            self.assertEqual(cm.exception.code, "CLOUD_COMPONENTS_REQUIRED")
+            with self.subTest(components=components):
+                with self.assertRaises(PlanError) as cm:
+                    plan(overlay(), components=components)
+                self.assertEqual(cm.exception.code, "CLOUD_COMPONENTS_REQUIRED")
 
     def test_single_component_is_rejected_even_when_both_digests_are_already_filled(self):
         # Updating one side of a filled overlay would mix two releases (GitOps validate rejects it).
@@ -123,12 +124,14 @@ class CloudPlanner(unittest.TestCase):
             "same repository, other region": OTHER_REGION_HOST + "/seokpan-fnd-backend",
         }
         for label, name in bad_names.items():
-            with self.subTest(case=label), self.assertRaises(PlanError) as cm:
-                plan(overlay(backend_name=name))
+            with self.subTest(case=label):
+                with self.assertRaises(PlanError) as cm:
+                    plan(overlay(backend_name=name))
+                self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
+        with self.subTest(case="frontend, other account"):
+            with self.assertRaises(PlanError) as cm:
+                plan(overlay(frontend_name=OTHER_ACCOUNT_HOST + "/seokpan-fnd-frontend"))
             self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
-        with self.subTest(case="frontend, other account"), self.assertRaises(PlanError) as cm:
-            plan(overlay(frontend_name=OTHER_ACCOUNT_HOST + "/seokpan-fnd-frontend"))
-        self.assertEqual(cm.exception.code, "NEWNAME_MISMATCH")
 
     def test_metadata_ecr_repository_must_match_the_approved_repository(self):
         meta = metadata()
