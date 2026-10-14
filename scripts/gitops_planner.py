@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/07
+# 수정 날짜: 2026-10-13 (Cloud ECR digest 갱신)
 """hybrid-gitops Image Promotion pure planner (hybrid-app #15).
 
 입력(image-metadata.json 내용 + 로컬 checkout 파일 내용)만으로 선택 환경의 FE/BE Image
@@ -40,6 +41,7 @@ ENV_KUSTOMIZATION = {
     "cloud": "apps/overlays/cloud/runtime/kustomization.yaml",
 }
 MIGRATION_PATH = "operations/ocp-lab/migration/job.yaml"
+INPUT_PLACEHOLDER = "INPUT_REQUIRED"  # Cloud overlay digest until the first Promotion (hybrid-app#47)
 
 
 class PlanError(RuntimeError):
@@ -191,7 +193,7 @@ def _images_block(lines: Sequence[str], path: str) -> tuple:
     return begin, end
 
 
-def _find_entry(lines: Sequence[str], path: str, name: str) -> EntryRef:
+def _find_entry(lines: Sequence[str], path: str, name: str, allow_placeholder: bool = False) -> EntryRef:
     begin, end = _images_block(lines, path)
     starts = []
     for i in range(begin, end):
@@ -227,7 +229,7 @@ def _find_entry(lines: Sequence[str], path: str, name: str) -> EntryRef:
         raise PlanError("ENTRY_DIGEST_DUPLICATED", f"{path}: '{name}' has more than one digest field")
     index, m = digests[0]
     value = m.group("value")
-    if not DIGEST_RE.match(value):
+    if not (DIGEST_RE.match(value) or (allow_placeholder and value == INPUT_PLACEHOLDER)):
         raise PlanError("ENTRY_DIGEST_INVALID", f"{path}: '{name}' digest is not sha256:<64 hex>")
     return EntryRef(name, new_names[0], value, index, m.group("prefix"), m.group("suffix"))
 
@@ -326,6 +328,20 @@ def _repo_matches(new_name: str, repository: str) -> bool:
     return new_name == repository or new_name.endswith("/" + repository)
 
 
+# Approved Cloud newName values (team decision 2026-10-13, hybrid-app#47). Account, region and
+# repository are all fixed: the same repository path under another account or region is rejected.
+CLOUD_NEWNAME = {
+    "backend": "847835841591.dkr.ecr.ap-northeast-2.amazonaws.com/seokpan-fnd-backend",
+    "frontend": "847835841591.dkr.ecr.ap-northeast-2.amazonaws.com/seokpan-fnd-frontend",
+}
+
+
+def _cloud_target_matches(new_name: str, component: str, metadata_repository: str) -> bool:
+    """newName must equal the approved full URI and its repository must be the metadata's ECR repository."""
+    approved = CLOUD_NEWNAME[component]
+    return new_name == approved and approved.split("/", 1)[1] == metadata_repository
+
+
 # ---------------------------------------------------------------- plan
 
 @dataclass(frozen=True)
@@ -380,15 +396,17 @@ def plan_promotion(
     selected = tuple(c for c in COMPONENTS if c in requested)
     parsed = parse_metadata(meta)
 
-    if env == "cloud":
-        if any(parsed.components[c].ecr is not None for c in selected):
-            raise PlanError(
-                "CLOUD_NOT_IMPLEMENTED",
-                "Cloud image edit format (newTag -> digest) and ECR repository URL handling are not agreed yet",
-            )
+    if env == "cloud" and not parsed.ecr_enabled:
         return PlanResult(
             env, selected, parsed.app_sha, (), {}, {},
             ("CLOUD_UNCHANGED: ECR metadata absent (Harbor digest is never copied to Cloud)",),
+        )
+    if env == "cloud" and set(selected) != set(COMPONENTS):
+        # The merged GitOps Cloud check accepts only both placeholders or both digests of ONE
+        # release candidate, so a partial Cloud promotion would fail validate (hybrid-app#48 review).
+        raise PlanError(
+            "CLOUD_COMPONENTS_REQUIRED",
+            "Cloud backend and frontend digests are promoted together from one release candidate; select both components",
         )
 
     path = ENV_KUSTOMIZATION[env]
@@ -405,11 +423,22 @@ def plan_promotion(
 
     for comp in selected:
         harbor = parsed.components[comp].harbor
-        ref = _find_entry(old_lines, path, IMAGE_NAME[comp])
+        ref = _find_entry(old_lines, path, IMAGE_NAME[comp], allow_placeholder=(env == "cloud"))
         if env == "recovery":
             if not _repo_matches(ref.new_name, harbor.repository):
                 raise PlanError("NEWNAME_MISMATCH", f"{path}: '{ref.name}' newName does not match the Harbor repository")
             digest = harbor.digest
+        elif env == "cloud":
+            ecr = parsed.components[comp].ecr
+            if ecr is None:
+                raise PlanError("CLOUD_ECR_MISSING", f"{comp}: ECR image is required for Cloud")
+            if not _cloud_target_matches(ref.new_name, comp, ecr.repository):
+                raise PlanError(
+                    "NEWNAME_MISMATCH",
+                    f"{path}: '{ref.name}' newName is not the approved Cloud ECR repository "
+                    "(account, region and repository are fixed)",
+                )
+            digest = ecr.digest  # never the Harbor digest
         else:
             repository, digest, note = _lab_target(lab_mapping, comp, harbor)
             if ref.new_name != repository:
@@ -468,8 +497,6 @@ def _load_json(path: str, label: str) -> object:
 
 def _read_checkout(gitops_dir: Path, env: str, components: Iterable[str]) -> dict:
     files: dict = {}
-    if env == "cloud":
-        return files
     for rel in sorted(allowed_paths(env, components)):
         try:
             text = safe_fs.read_text(gitops_dir, rel)  # no symlink / hard link is followed; line endings kept

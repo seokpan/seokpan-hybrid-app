@@ -289,10 +289,12 @@ class CloudTests(unittest.TestCase):
         self.assertEqual(r.status, "NO_CHANGE")
         self.assertTrue(any(n.startswith("CLOUD_UNCHANGED") for n in r.notes))
 
-    def test_ecr_metadata_fails_closed_until_format_agreed(self) -> None:
+    def test_ecr_metadata_without_overlay_file_fails_closed(self) -> None:
         with self.assertRaises(target.PlanError) as ctx:
-            target.plan_promotion(metadata(ecr=True), "cloud", ["backend"], {})
-        self.assertEqual(ctx.exception.code, "CLOUD_NOT_IMPLEMENTED")
+            target.plan_promotion(metadata(ecr=True), "cloud", ["backend", "frontend"], {})
+        # F2 (hybrid-app#47): Cloud is implemented. With ECR metadata the plan needs the
+        # Cloud overlay file; without it the plan fails closed instead of guessing.
+        self.assertEqual(ctx.exception.code, "FILE_MISSING")
 
 
 class MetadataTests(unittest.TestCase):
