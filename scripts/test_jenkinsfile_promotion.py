@@ -108,8 +108,8 @@ class PromotionStageTest(unittest.TestCase):
 
     def test_remote_check_runs_for_every_target_before_any_write(self):
         promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
-        check = promo.index("runPromotion(target, '--remote-check')")
-        write = promo.index("runPromotion(target, '--write')")
+        check = promo.index("runPromotion(target, '--remote-check', baseSha)")
+        write = promo.index("runPromotion(target, '--write', baseSha)")
         self.assertLess(check, write)
 
     def test_each_environment_keeps_its_own_result_files(self):
@@ -125,9 +125,21 @@ class PromotionStageTest(unittest.TestCase):
         m = re.search(r"choice\(\s*name: 'PROMOTION_MODE',\s*choices: \[([^\]]*)\]", TEXT)
         self.assertTrue(m.group(1).lstrip().startswith("'OFF'"))
 
+    def test_base_sha_is_pinned_once_and_checkout_is_restored_before_every_run(self):
+        promo = block("stage('Promote GitOps (Recovery + Cloud PR)')")
+        helper = block("def runPromotion")
+        self.assertEqual(promo.count("rev-parse HEAD"), 1)  # pinned once, from the first clone
+        self.assertLess(promo.index("def baseSha"),
+                        promo.index("runPromotion(target, '--remote-check', baseSha)"))
+        self.assertIn("matches('[0-9a-f]{40}')", promo)
+        self.assertIn("switch --detach ${baseSha}", helper)
+        self.assertIn("--expected-base-sha ${baseSha}", helper)
+        self.assertLess(helper.index("switch --detach"), helper.index("gitops_promote.py"))
+        self.assertNotIn("git fetch", helper)  # the base is never refreshed
+        self.assertNotIn("git -C .ci/gitops pull", TEXT)
+
     def test_no_secret_literals(self):
         self.assertNotRegex(TEXT, r"github_pat_|ghp_[A-Za-z0-9]{10,}")
-
 
 if __name__ == "__main__":
     unittest.main()
