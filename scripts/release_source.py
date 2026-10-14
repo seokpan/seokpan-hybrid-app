@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# 수정 날짜: 2026/10/14 (Cloud 지원: 환경별 출처 경로, ecr_digest, 승인 newName 대조, patches 신설)
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
+# 수정 날짜: 2026/10/14 (Cloud 지원: 환경별 출처 경로, ecr_digest, 승인 newName 대조, patches 신설, Promotion 연동)
 """Release-source annotation renderer for hybrid-gitops (hybrid-app #15). Offline, no network.
 
 Given an approved Release candidate (`releases/<release-id>.json`) and a local hybrid-gitops checkout,
@@ -34,7 +34,7 @@ import difflib
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -246,6 +246,44 @@ def plan_release_source(candidate_text: str, env: str, files: Mapping[str, str])
         raise ReleaseSourceError("ALLOWLIST_VIOLATION", "paths outside the allowlist: " + ", ".join(extra))
     old = {p: files[p] for p in new if p in files}
     return SourcePlan(env, release_id, app_sha, old, new)
+
+
+def attach_to_plan(
+    plan: gitops_planner.PlanResult, candidate_text: str, files: Mapping[str, str]
+) -> gitops_planner.PlanResult:
+    """Add the release-source annotation to a Promotion plan so Digest, candidate and annotation land in ONE PR.
+
+    plan_release_source needs the Promotion merged first. Here the claim "annotation matches the images" is
+    checked against the kustomization text the plan is about to write, so the two cannot drift apart.
+    NO_CHANGE plans and lab (which has no release-source) are returned untouched.
+    `files` is the checkout's current text (the existing release-source.yaml, if any, becomes the old side).
+    """
+    if plan.env not in SUPPORTED_ENVS or plan.status == "NO_CHANGE":
+        return plan
+    env = plan.env
+    release_id, app_sha, digests = parse_candidate(candidate_text, env)
+    if app_sha != plan.app_sha:
+        raise ReleaseSourceError("CANDIDATE_INVALID", "candidate App SHA differs from the plan App SHA")
+    kust_path = gitops_planner.ENV_KUSTOMIZATION[env]
+    promoted = plan.new_files.get(kust_path)
+    if promoted is None:
+        raise ReleaseSourceError("KUSTOMIZATION_MISSING", f"{kust_path} is not part of the plan")
+    check_images_promoted(promoted, env, digests)
+    src = source_path(env)
+    if src in plan.new_files:
+        raise ReleaseSourceError("ALLOWLIST_VIOLATION", f"plan already contains {src}")
+    new_files = dict(plan.new_files)
+    old_files = dict(plan.old_files)
+    new_files[kust_path] = register_patch(promoted, env)
+    rendered = render_source(release_id, app_sha)
+    if files.get(src) != rendered:  # an identical existing file is left alone
+        new_files[src] = rendered
+        if src in files:
+            old_files[src] = files[src]
+    extra = sorted(set(new_files) - allowed_paths(env))
+    if extra:
+        raise ReleaseSourceError("ALLOWLIST_VIOLATION", "paths outside the allowlist: " + ", ".join(extra))
+    return replace(plan, old_files=old_files, new_files=new_files)
 
 
 def _read(gitops_dir: Path, env: str) -> dict:

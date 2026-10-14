@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/07
 # 수정 날짜: 2026-10-13 (Cloud ECR digest 갱신)
-# 수정 날짜: 2026-10-14 (Recovery FE/BE 동시 갱신 필수, release-source 허용 경로)
+# 수정 날짜: 2026-10-14 (Recovery FE/BE 동시 갱신 필수, release-source 허용 경로, 새 파일 diff)
 """hybrid-gitops Image Promotion pure planner (hybrid-app #15).
 
 입력(image-metadata.json 내용 + 로컬 checkout 파일 내용)만으로 선택 환경의 FE/BE Image
@@ -384,11 +384,12 @@ class PlanResult:
     def unified_diff(self) -> str:
         chunks = []
         for path in sorted(self.new_files):
+            old = self.old_files.get(path)  # a newly created file (release-source.yaml) has no old text
             chunks.extend(
                 difflib.unified_diff(
-                    self.old_files[path].splitlines(keepends=True),
+                    (old or "").splitlines(keepends=True),
                     self.new_files[path].splitlines(keepends=True),
-                    fromfile=f"a/{path}",
+                    fromfile=f"a/{path}" if old is not None else "/dev/null",
                     tofile=f"b/{path}",
                 )
             )

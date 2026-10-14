@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # 작성자: 최유준 / 작성 날짜: 2026/10/08
-# 수정 날짜: 2026/10/14 (Cloud 지원 시험 보완)
+# 수정 날짜: 2026/10/14 (Cloud 지원 시험 보완, Promotion 연동 시험)
 """Unit tests for scripts/release_source.py (hybrid-app #15; offline, temporary files only)."""
 
 from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import io
 import json
 import os
@@ -206,12 +207,16 @@ def cloud_kust_text(**kw) -> str:
     return CLOUD_HEAD + cloud_images(**kw) + CLOUD_TAIL
 
 
-def cloud_candidate(be: str = E_BE, fe: str = E_FE, rid: str = CLOUD_RID) -> str:
+def cloud_meta(be: str = E_BE, fe: str = E_FE) -> dict:
     meta = copy.deepcopy(fx.metadata(ecr=True))
     for name, digest in (("backend", be), ("frontend", fe)):
         meta["components"][name]["ecr"]["final_digest"] = digest
         meta["release_json_images"][name]["ecr_digest"] = digest
-    return release_candidate.render_json(release_candidate.build_candidate(meta, "cloud", rid))
+    return meta
+
+
+def cloud_candidate(be: str = E_BE, fe: str = E_FE, rid: str = CLOUD_RID) -> str:
+    return release_candidate.render_json(release_candidate.build_candidate(cloud_meta(be, fe), "cloud", rid))
 
 
 class CloudRegisterTests(unittest.TestCase):
@@ -390,6 +395,114 @@ class CloudCliTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("IMAGES_NOT_PROMOTED", err)
         self.assertEqual(self.snapshot(), before)
+
+
+# ---------------------------------------------------------------- Promotion attach (hybrid-app #50)
+def promoted_recovery_plan(files: dict = None):
+    """Plan a real Recovery promotion (OLD -> NEW digests); returns (plan, metadata)."""
+    meta = fx.metadata(be=fx.NEW_BE, fe=fx.NEW_FE)
+    plan = gitops_planner.plan_promotion(
+        meta, "recovery", ["backend", "frontend"], files if files is not None else {KUST: kust_text()}
+    )
+    return plan, meta
+
+
+def recovery_candidate_for(meta: dict) -> str:
+    return release_candidate.render_json(release_candidate.build_candidate(meta, "recovery", wx.RID))
+
+
+def promoted_cloud_plan():
+    """Plan a real Cloud promotion (INPUT_REQUIRED -> ECR digests); returns (plan, files)."""
+    placeholder = gitops_planner.INPUT_PLACEHOLDER
+    files = {CLOUD_KUST: cloud_kust_text(be=placeholder, fe=placeholder)}
+    plan = gitops_planner.plan_promotion(cloud_meta(), "cloud", ["backend", "frontend"], files)
+    return plan, files
+
+
+class AttachToPlanTests(unittest.TestCase):
+    def test_recovery_adds_the_annotation_to_the_same_plan(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        out = target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text()})
+        self.assertEqual(set(out.new_files), {KUST, SRC})
+        self.assertEqual(set(out.new_files), target.allowed_paths("recovery"))
+        self.assertEqual(out.new_files[KUST], target.register_patch(plan.new_files[KUST], "recovery"))
+        self.assertEqual(out.new_files[SRC], target.render_source(wx.RID, APP_SHA))
+        self.assertEqual(out.old_files, {KUST: kust_text()})
+        self.assertEqual(out.image_changes, plan.image_changes)
+        self.assertIn(fx.NEW_BE, out.new_files[KUST])
+        self.assertNotIn(fx.OLD_BE, out.new_files[KUST])
+        diff = out.unified_diff()
+        self.assertIn("--- /dev/null", diff)
+        self.assertIn("+++ b/" + SRC, diff)
+
+    def test_cloud_adds_the_annotation_to_the_same_plan(self) -> None:
+        plan, files = promoted_cloud_plan()
+        out = target.attach_to_plan(plan, cloud_candidate(), files)
+        self.assertEqual(set(out.new_files), {CLOUD_KUST, CLOUD_SRC})
+        self.assertEqual(set(out.new_files), target.allowed_paths("cloud"))
+        self.assertEqual(out.new_files[CLOUD_KUST], target.register_patch(plan.new_files[CLOUD_KUST], "cloud"))
+        self.assertEqual(out.new_files[CLOUD_SRC], target.render_source(CLOUD_RID, APP_SHA))
+        self.assertEqual(out.old_files, {CLOUD_KUST: files[CLOUD_KUST]})
+        self.assertIn(E_BE, out.new_files[CLOUD_KUST])
+        self.assertNotIn(gitops_planner.INPUT_PLACEHOLDER, out.new_files[CLOUD_KUST])
+        self.assertIn("--- /dev/null", out.unified_diff())
+
+    def test_no_change_plan_is_returned_untouched(self) -> None:
+        meta = fx.metadata(be=fx.OLD_BE, fe=fx.OLD_FE)
+        plan = gitops_planner.plan_promotion(meta, "recovery", ["backend", "frontend"], {KUST: kust_text()})
+        self.assertEqual(plan.status, "NO_CHANGE")
+        self.assertIs(target.attach_to_plan(plan, "not even parsed", {}), plan)
+
+    def test_lab_plan_is_returned_untouched(self) -> None:
+        plan = gitops_planner.PlanResult("lab", ("backend", "frontend"), APP_SHA, (), {"x": "a"}, {"x": "b"}, ())
+        self.assertIs(target.attach_to_plan(plan, "not even parsed", {}), plan)
+
+    def test_candidate_that_differs_from_the_planned_digests_is_rejected(self) -> None:
+        plan, _ = promoted_recovery_plan()
+        other = recovery_candidate_for(fx.metadata(be=fx.H_BE, fe=fx.H_FE))
+        with self.subTest(env="recovery"):
+            with self.assertRaises(target.ReleaseSourceError) as cm:
+                target.attach_to_plan(plan, other, {KUST: kust_text()})
+            self.assertEqual(cm.exception.code, "IMAGES_NOT_PROMOTED")
+        cloud_plan, files = promoted_cloud_plan()
+        with self.subTest(env="cloud"):
+            with self.assertRaises(target.ReleaseSourceError) as cm:
+                target.attach_to_plan(cloud_plan, cloud_candidate(be=STALE), files)
+            self.assertEqual(cm.exception.code, "IMAGES_NOT_PROMOTED")
+
+    def test_plan_and_candidate_must_share_the_app_sha(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        skewed = dataclasses.replace(plan, app_sha="0" * 40)
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.attach_to_plan(skewed, recovery_candidate_for(meta), {KUST: kust_text()})
+        self.assertEqual(cm.exception.code, "CANDIDATE_INVALID")
+
+    def test_an_existing_source_file_becomes_the_old_side_of_the_diff(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        stale = target.render_source(f"rel-recovery-20261009T010000Z-{APP_SHA[:12]}-c3d4e5f6", APP_SHA)
+        out = target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text(), SRC: stale})
+        self.assertEqual(out.old_files[SRC], stale)
+        self.assertEqual(out.new_files[SRC], target.render_source(wx.RID, APP_SHA))
+        self.assertIn("--- a/" + SRC, out.unified_diff())
+
+    def test_an_identical_source_file_is_not_rewritten(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        same = target.render_source(wx.RID, APP_SHA)
+        out = target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text(), SRC: same})
+        self.assertEqual(set(out.new_files), {KUST})
+
+    def test_a_kustomization_without_a_single_patches_block_is_refused(self) -> None:
+        text = kust_text().replace("patches:\n", "other:\n")
+        plan, meta = promoted_recovery_plan({KUST: text})
+        with self.assertRaises(target.ReleaseSourceError) as cm:
+            target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: text})
+        self.assertEqual(cm.exception.code, "PATCHES_BLOCK")
+
+    def test_the_original_plan_is_not_mutated(self) -> None:
+        plan, meta = promoted_recovery_plan()
+        before = (dict(plan.new_files), dict(plan.old_files))
+        target.attach_to_plan(plan, recovery_candidate_for(meta), {KUST: kust_text()})
+        self.assertEqual((dict(plan.new_files), dict(plan.old_files)), before)
 
 
 class CliTests(unittest.TestCase):
