@@ -9,7 +9,7 @@ Modes (nothing is written unless `--write` is given):
   --write        pushes `promotion/<release-id>` and opens ONE Pull Request to main (needs GH_USER/GH_TOKEN).
 
 This tool never pushes to main, never merges, and never edits an existing Branch or PR. The Pull
-Request is reviewed and merged by a human. It is not wired into the Jenkinsfile yet (follow-up).
+Request is reviewed and merged by a human. Jenkinsfile.image-pipeline calls it behind PROMOTION_MODE (default OFF).
 
 Credentials come only from the environment (GH_USER, GH_TOKEN) and are read after every offline
 check has passed, so an invalid input never reaches the credential.
