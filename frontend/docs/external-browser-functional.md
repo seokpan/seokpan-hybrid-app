@@ -1,5 +1,7 @@
 # 외부 대상의 3 Client 업무 검증
 
+> **B 전수 대조 후속 — 2026-10-21:** [최종 종료](https://github.com/seokpan/seokpan-hybrid-docs/blob/main/execution/B_ROSA_FINAL_CLOSEOUT_20261021.md)와 [실제 시험 결과](https://github.com/seokpan/seokpan-hybrid-docs/blob/main/execution/HPA_ATTEMPT04_VERIFIED_RESULTS_20261021.md)를 우선한다. B ROSA·정확한 소유 범위 잔존 자원·Snapshot4개 정리는 완료다. 아래 절차·입력 대기·명령은 작성 당시 기록 또는 재사용 계약이며 현재 재실행 요청이 아니다. A 자원과 다른 담당의 종료는 판정하지 않는다. [전체 대조](https://github.com/seokpan/seokpan-hybrid-docs/blob/078b93184790231fbc3b0e03c9ce0b767ab39dab/execution/TJUNG03_FULL_REPOSITORY_AUDIT_20261021.md).
+
 `npm run e2e:external`은 기존 로컬 Memory 시험과 분리된 실행 경로다. 지정 HTTPS origin에서 실제 FE를 사용하고 Member 2개·Guest 1개, 고유 비공개 시험방을 만든다. 기존 사용자 수·빈 로비·전체 순위 표는 판정에 사용하지 않는다. 서버 기동·Pod 변경·부하 확대·로그인 세션 재사용은 없다.
 
 외부 실행 전 대상 Release/Provider·계정 생성/채팅/게임 기록 쓰기·관측·사용창을 확인한다. 성공은 해당 기능 Run에 한정되며 SQL/Redis 접속 확인, p95/부하/6000명/Alert/RTO/RPO 완료를 뜻하지 않는다. Backend 2000ms 보호 조건은 바꾸지 않는다.
