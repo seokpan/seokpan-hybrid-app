@@ -1,5 +1,7 @@
 # 환경별 DB·Redis 프로토콜 연결 계약
 
+> **B 전수 대조 후속 — 2026-10-21:** [최종 종료](https://github.com/seokpan/seokpan-hybrid-docs/blob/main/execution/B_ROSA_FINAL_CLOSEOUT_20261021.md)와 [실제 시험 결과](https://github.com/seokpan/seokpan-hybrid-docs/blob/main/execution/HPA_ATTEMPT04_VERIFIED_RESULTS_20261021.md)를 우선한다. B ROSA·정확한 소유 범위 잔존 자원·Snapshot4개 정리는 완료다. 아래 절차·입력 대기·명령은 작성 당시 기록 또는 재사용 계약이며 현재 재실행 요청이 아니다. A 자원과 다른 담당의 종료는 판정하지 않는다. [전체 대조](https://github.com/seokpan/seokpan-hybrid-docs/pull/140).
+
 이 변경은 App #1의 고정 접속 대상 검사를 환경별 **정확한 승인 대상** 검사로 바꾼다. 같은 Source/Image로 Cloud, 실습, 격리 복구 대상에 연결하도록 준비하며, 대상·계정·드라이버·옵션 검사와 CA/Hostname 검증을 유지한다. 실제 Image Build/Scan, lab Ready/Migration/게임, RDS/ElastiCache, Offline Recovery의 완료 판정은 별도다.
 
 현재 Cloud·lab·Recovery의 목표 엔진은 **Valkey 7.2 계열**이다. [Data 계약과 Source](https://github.com/seokpan/seokpan-hybrid-infra/issues/19)는 Infra #37로 전환됐고, App의 `redis-py`·`SEOKPAN_REDIS_*`·`rediss://` 인터페이스는 유지한다. 엔진 선택·코드 병합을 실제 호환성·배포 성공으로 승계하지 않는다.
